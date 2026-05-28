@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Gamut — How well do you know color?</title>
+  <meta name="description" content="Gamut is a minimalist color-matching game. Memorize a target color, then pick its closest match from a palette." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#" data-action="home" aria-label="Gamut home">
+      <span class="wordmark">gamut</span>
+      <span class="logo-bar" aria-hidden="true"></span>
+    </a>
+    <button class="theme-toggle" id="themeToggle" aria-label="Toggle dark mode" type="button">
+      <span class="theme-icon" aria-hidden="true"></span>
+    </button>
+  </header>
+
+  <main id="app">
+    <!-- HOME -->
+    <section class="screen screen--home is-active" id="screen-home">
+      <div class="home-intro">
+        <h1 class="headline">How well do you know color?</h1>
+        <p class="sub">Memorize a target hue for five seconds, then pick its closest match from the palette. Lean into the full range — your gamut.</p>
+      </div>
+      <div class="space-grid" id="spaceGrid">
+        <!-- color space cards inserted by JS -->
+      </div>
+    </section>
+
+    <!-- MEMORIZE -->
+    <section class="screen screen--memorize" id="screen-memorize" aria-hidden="true">
+      <div class="memorize-fill" id="memorizeFill"></div>
+      <div class="countdown" aria-live="polite">
+        <svg viewBox="0 0 44 44" width="56" height="56" aria-hidden="true">
+          <circle class="countdown-track" cx="22" cy="22" r="19" />
+          <circle class="countdown-progress" id="countdownProgress" cx="22" cy="22" r="19" />
+        </svg>
+        <span class="countdown-label" id="countdownLabel">5</span>
+      </div>
+    </section>
+
+    <!-- SELECT -->
+    <section class="screen screen--select" id="screen-select" aria-hidden="true">
+      <div class="select-header">
+        <h2>Mix the match</h2>
+        <p class="muted">Dial in the color you saw using the <span id="selectSpaceName">—</span> controls.</p>
+      </div>
+      <div class="picker">
+        <div class="picker-preview" id="pickerPreview" aria-live="polite">
+          <span class="picker-hex" id="pickerHex">#000000</span>
+        </div>
+        <div class="picker-controls" id="pickerControls"></div>
+        <button class="btn btn--primary picker-submit" id="pickerSubmit" type="button">Lock in</button>
+      </div>
+    </section>
+
+    <!-- RESULT -->
+    <section class="screen screen--result" id="screen-result" aria-hidden="true">
+      <div class="result-compare">
+        <figure class="result-swatch">
+          <div class="result-color" id="resultTarget"></div>
+          <figcaption>
+            <span class="muted">Target</span>
+            <span class="hex" id="resultTargetHex">#000000</span>
+          </figcaption>
+        </figure>
+        <figure class="result-swatch">
+          <div class="result-color" id="resultPick"></div>
+          <figcaption>
+            <span class="muted">Your pick</span>
+            <span class="hex" id="resultPickHex">#000000</span>
+          </figcaption>
+        </figure>
+      </div>
+
+      <div class="result-stats">
+        <div class="score">
+          <span class="score-number" id="scoreNumber">0</span>
+          <span class="score-out">/ 100</span>
+        </div>
+        <div class="result-meta">
+          <span class="label" id="resultLabel">—</span>
+          <span class="muted">ΔE <span id="resultDelta">0.0</span></span>
+        </div>
+      </div>
+
+      <div class="result-actions">
+        <button class="btn btn--primary" data-action="again" type="button">Play again</button>
+        <button class="btn" data-action="home" type="button">Change palette</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span class="muted">gamut · a static color game</span>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
