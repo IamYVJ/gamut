@@ -1078,7 +1078,7 @@ input[type="range"]::-moz-range-thumb {
 }
 
 /* Per-mode error next to a guess on the reveal leaderboard (ΔE, "off by …"). */
-.mp-error {
+.mp-guess-error {
   font-size: 12px;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
@@ -1111,6 +1111,64 @@ input[type="range"]::-moz-range-thumb {
   border-color: #e5484d;
 }
 .mp-round-clock[hidden] { display: none; }
+
+/* Invite banner on the setup screen (arrived via ?room=CODE link). */
+.mp-invite-hint {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: center;
+}
+.mp-invite-hint[hidden] { display: none; }
+/* When invited, the primary action is Join — soften Host so it doesn't compete. */
+.mp-setup-actions .btn.is-muted {
+  background: var(--surface);
+  color: var(--muted);
+  border-color: var(--border);
+  box-shadow: none;
+}
+
+/* Transient toast (e.g. host closed the room). */
+.mp-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%) translateY(8px);
+  z-index: 60;
+  max-width: min(90vw, 420px);
+  padding: 12px 18px;
+  border-radius: 999px;
+  background: var(--text);
+  color: var(--bg);
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  transition: opacity var(--t) var(--ease), transform var(--t) var(--ease);
+  pointer-events: none;
+}
+.mp-toast.is-shown {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* Visually hidden but exposed to assistive tech (round-timer announcements). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 /* ---------- Footer ---------- */
 .footer {

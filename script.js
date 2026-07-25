@@ -1427,6 +1427,39 @@ function mpSetupError(msg) {
   else { el.textContent = ''; el.hidden = true; }
 }
 
+/* Show/clear the "you've been invited to room N" banner and, when invited,
+   de-emphasize Host so Join reads as the obvious next step. */
+function mpSetInvite(code) {
+  const hint = $('mpInviteHint');
+  if (hint) {
+    if (code) { hint.textContent = `You're invited to room ${code} — enter your name and Join.`; hint.hidden = false; }
+    else { hint.textContent = ''; hint.hidden = true; }
+  }
+  const host = $('mpHostBtn');
+  if (host) host.classList.toggle('is-muted', !!code);
+}
+
+/* Brief self-dismissing toast for events that pull a player out of a room
+   (e.g. the host closed it) so the jump back home isn't silent. */
+let mpToastTimer = null;
+function mpToast(msg) {
+  let el = $('mpToast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'mpToast';
+    el.className = 'mp-toast';
+    el.setAttribute('role', 'status');
+    el.setAttribute('aria-live', 'polite');
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  // reflow so the transition replays if a toast is already up
+  void el.offsetWidth;
+  el.classList.add('is-shown');
+  if (mpToastTimer) clearTimeout(mpToastTimer);
+  mpToastTimer = setTimeout(() => { el.classList.remove('is-shown'); mpToastTimer = null; }, 3600);
+}
+
 /* The invite link deep-links friends straight to the join screen with the
    room code prefilled (see boot()). */
 function mpShareLink() {
@@ -1494,11 +1527,51 @@ function mpRoundClockEl() {
   return el;
 }
 
+/* An off-screen live region so screen-reader users get the one "10 seconds
+   left" cue without hearing the pill tick every second. */
+let mpAnnounced10 = false;
+function mpAnnounceEl() {
+  let el = $('mpAnnounce');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'mpAnnounce';
+    el.className = 'sr-only';
+    el.setAttribute('aria-live', 'polite');
+    el.setAttribute('role', 'status');
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function mpAnnounce(msg) {
+  const el = mpAnnounceEl();
+  el.textContent = '';
+  setTimeout(() => { el.textContent = msg; }, 30);   // clear→set so it re-announces
+}
+
+function mpRoundClockSecs() {
+  return Math.max(0, Math.ceil((mp.roundEndsAt - Date.now()) / 1000));
+}
+
 function mpRenderRoundClock() {
   const el = mpRoundClockEl();
-  const secs = Math.max(0, Math.ceil((mp.roundEndsAt - Date.now()) / 1000));
+  const secs = mpRoundClockSecs();
   el.textContent = `⏱ ${secs}s`;
   el.classList.toggle('is-urgent', secs <= 10);
+}
+
+/* Interval body: repaint the pill, announce the 10s mark once, and — since a
+   backgrounded host's setTimeout can be throttled — enforce the deadline here
+   too as a backstop so the auto-reveal still fires. */
+function mpRoundTick() {
+  mpRenderRoundClock();
+  const secs = mpRoundClockSecs();
+  if (!mpAnnounced10 && secs <= 10 && secs > 0) {
+    mpAnnounced10 = true;
+    mpAnnounce(`${secs} seconds left to lock in.`);
+  }
+  if (mp.role === 'host' && mp.phase === 'round' && Date.now() >= mp.roundEndsAt) {
+    hostReveal('timeout');
+  }
 }
 
 /* Every peer shows the countdown; the host also arms the authoritative
@@ -1507,11 +1580,12 @@ function mpStartRoundClock(limitMs) {
   mpStopRoundClock();
   const limit = Number(limitMs) > 0 ? Number(limitMs) : MP_ROUND_TIMEOUT_MS;
   mp.roundEndsAt = Date.now() + limit;
+  mpAnnounced10 = false;
   mpRoundClockEl().hidden = false;
   mpRenderRoundClock();
-  mp.roundClock = setInterval(mpRenderRoundClock, 500);
+  mp.roundClock = setInterval(mpRoundTick, 500);
   if (mp.role === 'host') {
-    mp.roundTimer = setTimeout(() => { if (mp.phase === 'round') hostReveal(); }, limit);
+    mp.roundTimer = setTimeout(() => { if (mp.phase === 'round') hostReveal('timeout'); }, limit);
   }
 }
 
@@ -1523,13 +1597,60 @@ function mpStopRoundClock() {
 }
 
 /* A short cue (blip + vibrate) so a player idling on the reveal screen notices
-   the next round's observe phase sliding in. */
+   the next round's observe phase sliding in. Audio may be suspended and vibrate
+   is a no-op on desktop/iOS, so when the tab is hidden we also flash the title
+   and favicon — the one signal that actually reaches a backgrounded player. */
 function mpNewRoundCue() {
   try { if (navigator.vibrate) navigator.vibrate([40, 30, 40]); } catch { /* unsupported */ }
   if (audioAvailable()) {
     const ctx = getAudio();
     if (ctx && ctx.state === 'running') playTone(880, 110, { type: 'triangle', gain: 0.09 });
   }
+  mpFlashTitle('▶ Your turn — gamut');
+}
+
+let mpTitleTimer = null;
+let mpTitleBase = null;
+const MP_ALERT_FAVICON =
+  'data:image/svg+xml,' +
+  encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#e5484d"/></svg>');
+
+function mpSetAlertFavicon(on) {
+  try {
+    let link = $('mpFavicon');
+    if (!on) { if (link) link.remove(); return; }
+    if (!link) {
+      link = document.createElement('link');
+      link.id = 'mpFavicon';
+      link.rel = 'icon';
+      document.head.appendChild(link);
+    }
+    link.href = MP_ALERT_FAVICON;
+  } catch { /* ignore */ }
+}
+
+/* Blink the tab title + favicon until the player returns to the tab. */
+function mpFlashTitle(msg) {
+  if (!document.hidden || mpTitleTimer) return;
+  mpTitleBase = document.title;
+  let on = false;
+  const stop = () => {
+    if (!mpTitleTimer) return;
+    clearInterval(mpTitleTimer);
+    mpTitleTimer = null;
+    if (mpTitleBase != null) document.title = mpTitleBase;
+    mpSetAlertFavicon(false);
+    document.removeEventListener('visibilitychange', onVis);
+    window.removeEventListener('focus', stop);
+  };
+  const onVis = () => { if (!document.hidden) stop(); };
+  mpTitleTimer = setInterval(() => {
+    on = !on;
+    document.title = on ? msg : mpTitleBase;
+    mpSetAlertFavicon(on);
+  }, 900);
+  document.addEventListener('visibilitychange', onVis);
+  window.addEventListener('focus', stop);
 }
 
 /* Tear everything down: kill the peer, cancel timers, wipe state. */
@@ -1724,8 +1845,7 @@ function hostRejoinRound(connId, reclaimed) {
 
   if (pl.submitted) {                                // already scored — just re-seat them
     mp.roundParticipants.add(connId);
-    if (mp.lastWaiting) mp.net.sendTo(connId, mp.lastWaiting);
-    hostBroadcastWaiting();
+    hostBroadcastWaiting();   // fresh snapshot carries the new connId to everyone
     hostMaybeReveal();
     return;
   }
@@ -1770,9 +1890,10 @@ function hostMaybeReveal() {
   hostReveal();
 }
 
-function hostReveal() {
+function hostReveal(reason) {
   if (mp.phase !== 'round') return;
   mp.phase = 'reveal';
+  const timedOut = reason === 'timeout';
   const results = [];
   for (const id of mp.roundParticipants) {
     const pl = mp.players.get(id);
@@ -1789,7 +1910,7 @@ function hostReveal() {
 
   const payload = {
     t: 'reveal', roundNo: mp.roundNo, gameKey: mp.gameKey,
-    spaceKey: mp.spaceKey, params: mp.params, results
+    spaceKey: mp.spaceKey, params: mp.params, results, timedOut
   };
   mp.lastReveal = payload;
   mp.net.broadcast(payload);
@@ -1946,7 +2067,19 @@ function clientOnData(msg) {
       break;
     case 'waiting':
       mp.waiting = msg.players || [];
-      if (mp.inWaiting) mpRenderWaitingBoard(mp.waiting);
+      if (mp.inWaiting) {
+        mpRenderWaitingBoard(mp.waiting);
+      } else if (mp.phase !== 'reveal') {
+        // Reconnected after we'd already locked in: the host still counts us
+        // as submitted, but we came back on the lobby screen. Re-enter waiting.
+        const meRow = mp.waiting.find(p => p.id === mp.meId);
+        if (meRow && meRow.submitted) {
+          mp.roundNo = msg.roundNo;
+          mp.phase = 'round';
+          mp.submitted = true;
+          mpShowWaiting();
+        }
+      }
       break;
     case 'round':
       mpNewRoundCue();
@@ -1961,6 +2094,7 @@ function clientOnData(msg) {
     case 'ended':
       mpTeardown();
       mpGoHome();
+      mpToast('The host closed the room.');
       break;
     case 'rejected':
     case 'error':
@@ -2240,9 +2374,10 @@ function showMpReveal(payload) {
   $('mpRevealTitle').textContent = `Round ${payload.roundNo}${game ? ' · ' + game.name : ''}`;
   const results = payload.results || [];
   const me = results.find(r => r.id === mp.meId);
-  $('mpRevealSub').textContent = me
+  const base = me
     ? (me.submitted ? `You scored ${me.roundScore} this round.` : 'You sat this one out.')
     : 'Round results';
+  $('mpRevealSub').textContent = payload.timedOut ? `⏱ Time's up — ${base}` : base;
 
   $('mpRevealCompare').innerHTML = mpTargetCompareHTML(payload);
   renderMpBoard(results);
@@ -2334,7 +2469,7 @@ function mpErrorLabel(guessValue) {
     }
     default: return '';
   }
-  return ` <span class="mp-error">${escapeHtml(txt)}</span>`;
+  return ` <span class="mp-guess-error">${escapeHtml(txt)}</span>`;
 }
 
 function renderMpBoard(results) {
@@ -2556,6 +2691,7 @@ function renderMpPaletteGrid() {
 function wireMpActions() {
   $('playFriends').addEventListener('click', () => {
     mpSetupError('');
+    mpSetInvite('');
     $('mpName').value = mpLoadName();
     $('mpCode').value = '';
     showMpSetup();
@@ -2666,6 +2802,7 @@ function mpConsumeInviteParam() {
   const code = Net.normalizeCode(raw);
   if (code.length !== 4) return;
   mpSetupError('');
+  mpSetInvite(code);
   $('mpName').value = mpLoadName();
   $('mpCode').value = code;
   showMpSetup();
