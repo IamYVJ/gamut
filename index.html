@@ -3,12 +3,16 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Gamut — How well do you know color?</title>
-  <meta name="description" content="Gamut is a minimalist color-matching game. Memorize a target color, then pick its closest match from a palette." />
+  <title>Gamut — How sharp are your senses?</title>
+  <meta name="description" content="Gamut is a suite of minimalist perception games. Observe a color, a duration, a cluster, or an angle — then reproduce it from memory." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
+  <!-- PeerJS via CDN, pinned. Provides window.Peer (WebRTC signaling + P2P).
+       The initial handshake needs network reachability; game traffic is then
+       direct peer-to-peer. See net.js for self-hosting the broker for LAN. -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 </head>
 <body>
   <header class="topbar">
@@ -22,21 +26,115 @@
   </header>
 
   <main id="app">
-    <!-- HOME -->
+    <!-- HOME: mode selector -->
     <section class="screen screen--home is-active" id="screen-home">
       <div class="home-intro">
-        <h1 class="headline">How well do you know color?</h1>
-        <p class="sub">Memorize a target hue for five seconds, then pick its closest match from the palette. Lean into the full range — your gamut.</p>
+        <h1 class="headline">How sharp are your senses?</h1>
+        <p class="sub">Pick a challenge. Observe for a moment, then reproduce what you remember — and see how close you got.</p>
       </div>
-      <div class="space-grid" id="spaceGrid">
-        <!-- color space cards inserted by JS -->
+      <div class="mode-grid" id="modeGrid">
+        <!-- game-mode cards inserted by JS -->
+      </div>
+      <div class="home-foot" id="homeFoot" hidden>
+        <button class="link-btn" id="resetStats" type="button">Reset scores</button>
+      </div>
+      <div class="home-mp">
+        <button class="btn btn--ghost" id="playFriends" type="button">Play with friends →</button>
+        <p class="muted mp-tagline">Same challenge, everyone at once. Host a room and share the code.</p>
       </div>
     </section>
 
-    <!-- MEMORIZE -->
-    <section class="screen screen--memorize" id="screen-memorize" aria-hidden="true">
-      <div class="memorize-fill" id="memorizeFill"></div>
-      <div class="countdown" aria-live="polite">
+    <!-- MP SETUP: host or join -->
+    <section class="screen screen--mp-setup" id="screen-mp-setup" aria-hidden="true">
+      <div class="section-head">
+        <button class="back" data-action="home" type="button">← Modes</button>
+        <div class="section-title">
+          <h2>Play with friends</h2>
+          <p class="muted">Everyone sees the same stimulus, then a leaderboard compares your guesses.</p>
+        </div>
+      </div>
+      <div class="mp-setup">
+        <label class="mp-field">
+          <span>Your name</span>
+          <input id="mpName" type="text" maxlength="16" placeholder="e.g. Alex" autocomplete="off" />
+        </label>
+        <div class="mp-setup-actions">
+          <button class="btn btn--primary" id="mpHostBtn" type="button">Host a room</button>
+          <div class="mp-join">
+            <input id="mpCode" type="text" inputmode="numeric" maxlength="4" placeholder="Code" aria-label="Room code" />
+            <button class="btn" id="mpJoinBtn" type="button">Join</button>
+          </div>
+        </div>
+        <p class="mp-error" id="mpSetupError" aria-live="polite" hidden></p>
+      </div>
+    </section>
+
+    <!-- MP LOBBY -->
+    <section class="screen screen--mp-lobby" id="screen-mp-lobby" aria-hidden="true">
+      <div class="section-head">
+        <button class="back" data-action="mp-leave" type="button">← Leave</button>
+        <div class="section-title">
+          <h2>Lobby</h2>
+          <p class="muted" id="mpLobbySub">Share the code so friends can join.</p>
+        </div>
+      </div>
+      <div class="mp-lobby">
+        <div class="mp-code-card">
+          <span class="mp-code-label muted">Room code</span>
+          <span class="mp-code" id="mpCodeDisplay">----</span>
+          <div class="mp-code-actions">
+            <button class="link-btn" id="mpCopyCode" type="button">Copy code</button>
+            <button class="link-btn" id="mpCopyLink" type="button">Copy invite link</button>
+          </div>
+          <span class="mp-net-status" id="mpNetStatus" aria-live="polite"></span>
+        </div>
+        <div class="mp-players" id="mpPlayers"></div>
+        <div class="mp-host-controls" id="mpHostControls" hidden>
+          <h3>Pick a challenge</h3>
+          <div class="mp-mode-grid" id="mpModeGrid"></div>
+          <div class="mp-palette-wrap" id="mpPaletteWrap" hidden>
+            <span class="muted">Palette</span>
+            <div class="mp-palette-grid" id="mpPaletteGrid"></div>
+          </div>
+          <button class="btn btn--primary mp-start" id="mpStartBtn" type="button" disabled>Start round</button>
+        </div>
+        <p class="muted mp-wait" id="mpLobbyWait" hidden>Waiting for the host to start…</p>
+      </div>
+    </section>
+
+    <!-- MP REVEAL: round leaderboard -->
+    <section class="screen screen--mp-reveal" id="screen-mp-reveal" aria-hidden="true">
+      <div class="section-head">
+        <button class="back" data-action="mp-leave" type="button">← Leave</button>
+        <div class="section-title">
+          <h2 id="mpRevealTitle">Round results</h2>
+          <p class="muted" id="mpRevealSub">—</p>
+        </div>
+      </div>
+      <div class="mp-reveal-compare" id="mpRevealCompare"></div>
+      <div class="mp-board" id="mpBoard"></div>
+      <div class="mp-reveal-actions" id="mpRevealActions"></div>
+    </section>
+
+    <!-- PALETTES: colour-mode config -->
+    <section class="screen screen--palettes" id="screen-palettes" aria-hidden="true">
+      <div class="section-head">
+        <button class="back" data-action="home" type="button">← Modes</button>
+        <div class="section-title">
+          <h2>Pick a palette</h2>
+          <p class="muted">Each palette restricts the sliders to colors that belong to that family.</p>
+        </div>
+      </div>
+      <div class="space-grid" id="spaceGrid">
+        <!-- color-space cards inserted by JS -->
+      </div>
+    </section>
+
+    <!-- OBSERVE: fullscreen stimulus (shared) -->
+    <section class="screen screen--observe" id="screen-observe" aria-hidden="true">
+      <div class="observe-stage" id="observeStage"></div>
+      <button class="observe-exit" data-action="home" type="button" aria-label="Exit round (Esc)" title="Exit (Esc)">✕</button>
+      <div class="countdown" id="observeCountdown" aria-live="polite" hidden>
         <svg viewBox="0 0 44 44" width="56" height="56" aria-hidden="true">
           <circle class="countdown-track" cx="22" cy="22" r="19" />
           <circle class="countdown-progress" id="countdownProgress" cx="22" cy="22" r="19" />
@@ -45,39 +143,24 @@
       </div>
     </section>
 
-    <!-- SELECT -->
-    <section class="screen screen--select" id="screen-select" aria-hidden="true">
-      <div class="select-header">
-        <h2>Mix the match</h2>
-        <p class="muted">Dial in the color you saw using the <span id="selectSpaceName">—</span> controls.</p>
-      </div>
-      <div class="picker">
-        <div class="picker-preview" id="pickerPreview" aria-live="polite">
-          <span class="picker-hex" id="pickerHex">#000000</span>
+    <!-- RESPOND: guessing UI (shared) -->
+    <section class="screen screen--respond" id="screen-respond" aria-hidden="true">
+      <div class="section-head">
+        <button class="back" data-action="home" type="button">← Modes</button>
+        <div class="section-title">
+          <h2 id="respondTitle">Mix the match</h2>
+          <p class="muted" id="respondSub">—</p>
         </div>
-        <div class="picker-controls" id="pickerControls"></div>
-        <button class="btn btn--primary picker-submit" id="pickerSubmit" type="button">Lock in</button>
+      </div>
+      <div class="respond" id="respondBody"></div>
+      <div class="respond-actions">
+        <button class="btn btn--primary respond-submit" id="respondSubmit" type="button">Lock in</button>
       </div>
     </section>
 
-    <!-- RESULT -->
+    <!-- RESULT: comparison + score (shared) -->
     <section class="screen screen--result" id="screen-result" aria-hidden="true">
-      <div class="result-compare">
-        <figure class="result-swatch">
-          <div class="result-color" id="resultTarget"></div>
-          <figcaption>
-            <span class="muted">Target</span>
-            <span class="hex" id="resultTargetHex">#000000</span>
-          </figcaption>
-        </figure>
-        <figure class="result-swatch">
-          <div class="result-color" id="resultPick"></div>
-          <figcaption>
-            <span class="muted">Your pick</span>
-            <span class="hex" id="resultPickHex">#000000</span>
-          </figcaption>
-        </figure>
-      </div>
+      <div class="result-compare" id="resultCompare"></div>
 
       <div class="result-stats">
         <div class="score">
@@ -86,21 +169,24 @@
         </div>
         <div class="result-meta">
           <span class="label" id="resultLabel">—</span>
-          <span class="muted">ΔE <span id="resultDelta">0.0</span></span>
+          <span class="muted" id="resultDetail"></span>
         </div>
+        <p class="result-record" id="resultRecord" aria-live="polite"></p>
       </div>
 
       <div class="result-actions">
         <button class="btn btn--primary" data-action="again" type="button">Play again</button>
-        <button class="btn" data-action="home" type="button">Change palette</button>
+        <button class="btn" id="resultSecondary" type="button" hidden></button>
+        <button class="btn" data-action="home" type="button">Modes</button>
       </div>
     </section>
   </main>
 
   <footer class="footer">
-    <span class="muted">gamut · a static color game</span>
+    <span class="muted">gamut · a suite of static perception games</span>
   </footer>
 
+  <script src="net.js"></script>
   <script src="script.js"></script>
 </body>
 </html>
