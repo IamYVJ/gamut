@@ -1657,6 +1657,7 @@ function mpFlashTitle(msg) {
 function mpTeardown() {
   clearTimers();
   mpStopRoundClock();
+  if (mpReconnectTimer) { clearTimeout(mpReconnectTimer); mpReconnectTimer = null; }
   if (mp.net) { try { mp.net.destroy(); } catch { /* already gone */ } }
   mp.net = null;
   mp.active = false;
@@ -2037,9 +2038,13 @@ function mpJoin() {
 
   mp.net = Net.joinHost(code, {
     onNetStatus: (s) => mpSetNetStatus(s),
-    onOpen: () => mp.net.send({ t: 'join', name: mp.name, clientId: mpClientId() }),
+    onOpen: () => {
+      if (mpReconnectTimer) { clearTimeout(mpReconnectTimer); mpReconnectTimer = null; }
+      mpSetNetStatus('online');
+      mp.net.send({ t: 'join', name: mp.name, clientId: mpClientId() });
+    },
     onData: (msg) => clientOnData(msg),
-    onClose: () => mpSetNetStatus('reconnecting'),
+    onClose: () => { mpSetNetStatus('reconnecting'); mpScheduleClientReconnect(0); },
     onError: (err) => mpClientError(err)
   });
 
@@ -2106,10 +2111,29 @@ function clientOnData(msg) {
 }
 
 function mpClientError(err) {
-  if (Net.isRecoverableError(err)) { mpSetNetStatus('reconnecting'); return; }
+  if (Net.isRecoverableError(err)) { mpSetNetStatus('reconnecting'); mpScheduleClientReconnect(0); return; }
   mpTeardown();
   mpSetupError(Net.describeError(err));
   showMpSetup();
+}
+
+/* A joiner's data connection can drop while its peer stays alive (e.g. the host
+   reloaded and re-hosts on the same code). PeerJS only auto-reconnects the
+   broker socket, not this connection — so re-open it ourselves with a capped
+   backoff. A successful reopen fires onOpen, which re-sends `join` (the host
+   reclaims the seat by clientId) and flips the status back to online. */
+let mpReconnectTimer = null;
+function mpScheduleClientReconnect(attempt) {
+  if (mp.role !== 'client' || !mp.net) return;
+  if (mp.net.isOpen && mp.net.isOpen()) { mpSetNetStatus('online'); return; }
+  if (attempt >= 6) { mpSetNetStatus('error', 'Lost the host — try rejoining.'); return; }
+  if (mpReconnectTimer) clearTimeout(mpReconnectTimer);
+  mpReconnectTimer = setTimeout(() => {
+    mpReconnectTimer = null;
+    if (mp.role !== 'client' || !mp.net) return;
+    try { mp.net.reconnect(); } catch { /* torn down */ }
+    mpScheduleClientReconnect(attempt + 1);
+  }, Math.min(800 * (attempt + 1), 4000));
 }
 
 /* ----- shared round playback (host + clients run the same code) ----- */
@@ -2133,8 +2157,16 @@ function mpPlayRound(round) {
   if (play) play(mp.params);
   // The Time round is a duration-estimation game — a visible ticking countdown
   // would hand players the very thing they're judging, so it runs without the
-  // round clock. (The host can still use "Reveal now" to move an AFK table on.)
-  if (round.gameKey !== 'time') mpStartRoundClock(round.limitMs);
+  // on-screen round clock. The host still arms a *silent* auto-reveal (no pill,
+  // no ticking) so one AFK player can't stall the table forever; "Reveal now"
+  // also still works.
+  if (round.gameKey !== 'time') {
+    mpStartRoundClock(round.limitMs);
+  } else if (mp.role === 'host') {
+    mpStopRoundClock();
+    const limit = Number(round.limitMs) > 0 ? Number(round.limitMs) : MP_ROUND_TIMEOUT_MS;
+    mp.roundTimer = setTimeout(() => { if (mp.phase === 'round') hostReveal('timeout'); }, limit);
+  }
 }
 
 /* Wrap runRespond so submitting scores locally and reports to the host. */
@@ -2758,7 +2790,10 @@ function wireActions() {
     const action = t.getAttribute('data-action');
     if (action === 'home') {
       e.preventDefault();
-      if (mp.active) mpTeardown();   // leave any room before bailing to the grid
+      // In a room, route through mpLeave so a host still broadcasts "ended"
+      // (otherwise joiners are stranded on "Reconnecting…"). mpLeave already
+      // tears down and returns home, so we're done.
+      if (mp.active) { mpLeave(); return; }
       clearTimers();
       renderModeCards();   // refresh best-score badges
       showScreen('home');
