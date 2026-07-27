@@ -29,6 +29,11 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute must always win. Several components set display via a
+   class (e.g. .mp-host-controls, .mp-palette-wrap), which otherwise overrides
+   the UA `[hidden] { display: none }` rule and leaks hidden UI on screen. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -837,7 +842,9 @@ input[type="range"]::-moz-range-thumb {
   flex-direction: column;
   gap: 14px;
 }
-.mp-setup-actions .btn { width: 100%; }
+/* Only the stacked top-level buttons (Host a room) go full-width — NOT the
+   Join button nested in .mp-join, which sits beside the code input. */
+.mp-setup-actions > .btn { width: 100%; }
 .mp-join { display: flex; gap: 10px; }
 .mp-join input {
   flex: 1;
@@ -995,6 +1002,14 @@ input[type="range"]::-moz-range-thumb {
 .mp-reveal-compare .value-card,
 .mp-reveal-compare .result-swatch { width: 100%; }
 .mp-reveal-compare .result-color { height: clamp(140px, 26vh, 220px); border-radius: var(--radius); }
+/* Colour reveal shows Target + Your pick side by side; each swatch fills its cell. */
+.mp-swatch-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  width: 100%;
+}
+.mp-swatch-pair .result-color { height: clamp(120px, 20vh, 180px); }
 
 .mp-board {
   max-width: 560px;
@@ -1028,10 +1043,24 @@ input[type="range"]::-moz-range-thumb {
 .mp-row.is-offline { opacity: 0.55; }
 .mp-rank { font-weight: 700; font-variant-numeric: tabular-nums; }
 .mp-row-name {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  font-weight: 500;
+  min-width: 0;
+}
+.mp-row-who {
   display: inline-flex;
   align-items: baseline;
   gap: 8px;
-  font-weight: 500;
+}
+/* Guess + per-mode error, wrapping under the name rather than beside it. */
+.mp-row-guess {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
   min-width: 0;
 }
 .mp-you {
@@ -1110,7 +1139,6 @@ input[type="range"]::-moz-range-thumb {
   color: #e5484d;
   border-color: #e5484d;
 }
-.mp-round-clock[hidden] { display: none; }
 
 /* Invite banner on the setup screen (arrived via ?room=CODE link). */
 .mp-invite-hint {
@@ -1124,7 +1152,6 @@ input[type="range"]::-moz-range-thumb {
   font-weight: 500;
   text-align: center;
 }
-.mp-invite-hint[hidden] { display: none; }
 /* When invited, the primary action is Join — soften Host so it doesn't compete. */
 .mp-setup-actions .btn.is-muted {
   background: var(--surface);

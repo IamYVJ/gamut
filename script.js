@@ -2131,7 +2131,10 @@ function mpPlayRound(round) {
     angle: mpPlayAngle, pitch: mpPlayPitch, tempo: mpPlayTempo
   }[round.gameKey];
   if (play) play(mp.params);
-  mpStartRoundClock(round.limitMs);
+  // The Time round is a duration-estimation game — a visible ticking countdown
+  // would hand players the very thing they're judging, so it runs without the
+  // round clock. (The host can still use "Reveal now" to move an AFK table on.)
+  if (round.gameKey !== 'time') mpStartRoundClock(round.limitMs);
 }
 
 /* Wrap runRespond so submitting scores locally and reports to the host. */
@@ -2379,36 +2382,64 @@ function showMpReveal(payload) {
     : 'Round results';
   $('mpRevealSub').textContent = payload.timedOut ? `⏱ Time's up — ${base}` : base;
 
-  $('mpRevealCompare').innerHTML = mpTargetCompareHTML(payload);
+  $('mpRevealCompare').innerHTML = mpCompareHTML(payload);
   renderMpBoard(results);
   renderMpRevealActions();
   mpWireReplayButtons();
   showScreen('mp-reveal');
 }
 
-function mpTargetCompareHTML(payload) {
+/* Reveal comparison: the round's actual value alongside *your* guess, mirroring
+   the single-player result screen. Your guess comes from your own row in the
+   results; if you didn't submit, only the actual is shown. */
+function mpCompareHTML(payload) {
   const p = payload.params || {};
+  const me = (payload.results || []).find(r => r.id === mp.meId);
+  const g = (me && me.submitted) ? me.guessValue : null;
+  const has = g != null;
+
   switch (payload.gameKey) {
-    case 'colour':
-      return `
+    case 'colour': {
+      const swatch = (label, rgb) => `
         <figure class="result-swatch">
-          <div class="result-color" style="background:${rgbToCss(p.target)}"></div>
-          <figcaption><span class="muted">Target</span><span class="hex">${rgbToHex(p.target)}</span></figcaption>
+          <div class="result-color" style="background:${rgbToCss(rgb)}"></div>
+          <figcaption><span class="muted">${label}</span><span class="hex">${rgbToHex(rgb)}</span></figcaption>
         </figure>`;
-    case 'time':
-      return valueCard({ label: 'Shown for', value: `${(p.showMs / 1000).toFixed(1)}s` });
-    case 'count':
-      return `<div class="dots-replay">${buildDots(p.positions || []).outerHTML}</div>` +
-             valueCard({ label: 'Actual', value: String(p.n) });
-    case 'angle':
-      return valueCard({ label: 'Shown', value: `${Math.round(p.angle)}°`,
-        media: dialMarkup(p.angle, 'dial--static dial--target') });
-    case 'pitch':
-      return valueCard({ label: 'Target', value: `${Math.round(p.freq)} Hz`,
-        media: `<button class="btn audio-btn" data-tone="${p.freq.toFixed(2)}" type="button">▶ Play</button>` });
-    case 'tempo':
-      return valueCard({ label: 'Actual', value: `${p.bpm} BPM`,
-        media: `<button class="btn audio-btn" data-bpm="${p.bpm}" type="button">▶ Hear</button>` });
+      const target = swatch('Target', p.target);
+      return has ? `<div class="mp-swatch-pair">${target}${swatch('Your pick', g)}</div>` : target;
+    }
+    case 'time': {
+      const actual = { label: 'Shown for', value: `${(p.showMs / 1000).toFixed(1)}s` };
+      return has ? valueRow(actual, { label: 'You guessed', value: `${Number(g).toFixed(1)}s` })
+                 : valueCard(actual);
+    }
+    case 'count': {
+      const dots = `<div class="dots-replay">${buildDots(p.positions || []).outerHTML}</div>`;
+      const actual = { label: 'Actual', value: String(p.n) };
+      return dots + (has ? valueRow(actual, { label: 'You guessed', value: String(g) })
+                         : valueCard(actual));
+    }
+    case 'angle': {
+      const actual = { label: 'Shown', value: `${Math.round(p.angle)}°`,
+        media: dialMarkup(p.angle, 'dial--static dial--target') };
+      return has ? valueRow(actual, { label: 'Your guess', value: `${Math.round(g)}°`,
+                     media: dialMarkup(g, 'dial--static dial--guess') })
+                 : valueCard(actual);
+    }
+    case 'pitch': {
+      const actual = { label: 'Target', value: `${Math.round(p.freq)} Hz`,
+        media: `<button class="btn audio-btn" data-tone="${p.freq.toFixed(2)}" type="button">▶ Play</button>` };
+      return has ? valueRow(actual, { label: 'Your guess', value: `${Math.round(g)} Hz`,
+                     media: `<button class="btn audio-btn" data-tone="${Number(g).toFixed(2)}" type="button">▶ Play</button>` })
+                 : valueCard(actual);
+    }
+    case 'tempo': {
+      const actual = { label: 'Actual', value: `${p.bpm} BPM`,
+        media: `<button class="btn audio-btn" data-bpm="${p.bpm}" type="button">▶ Hear</button>` };
+      return has ? valueRow(actual, { label: 'Your guess', value: `${g} BPM`,
+                     media: `<button class="btn audio-btn" data-bpm="${g}" type="button">▶ Hear</button>` })
+                 : valueCard(actual);
+    }
     default:
       return '';
   }
@@ -2481,10 +2512,16 @@ function renderMpBoard(results) {
     const round = r.submitted ? `+${r.roundScore}` : '—';
     const answer = r.submitted ? mpAnswerLabel(r.guessValue) : '';
     const error = r.submitted ? mpErrorLabel(r.guessValue) : '';
+    // Guess + per-mode error live on their own line under the name so they
+    // can't crush or clip the name column on narrow screens.
+    const guess = (answer || error) ? `<span class="mp-row-guess">${answer}${error}</span>` : '';
     return `
       <div class="mp-row${isMe ? ' is-me' : ''}${r.connected ? '' : ' is-offline'}">
         <span class="mp-rank">${rank}</span>
-        <span class="mp-row-name">${escapeHtml(r.name)}${isMe ? ' <span class="mp-you">you</span>' : ''}${answer}${error}</span>
+        <span class="mp-row-name">
+          <span class="mp-row-who">${escapeHtml(r.name)}${isMe ? ' <span class="mp-you">you</span>' : ''}</span>
+          ${guess}
+        </span>
         <span class="mp-row-round">${round}</span>
         <span class="mp-row-total">${r.total}</span>
       </div>`;
