@@ -1339,7 +1339,11 @@ const MP_REJOIN_GRACE_MS = 20000;
 
 const mp = {
   active: false,
-  role: null,            // 'host' | 'client'
+  role: null,            // 'host' | 'client' (in SERVER mode everyone is 'client')
+  mode: 'p2p',           // 'p2p' (WebRTC star) | 'server' (authoritative WebSocket)
+  isOwner: false,        // do I hold the owner controls? (p2p host, or server room owner)
+  ownerId: 'host',       // id of the owner seat: 'host' in p2p, a server pid in server mode
+  serverJoinMsg: null,   // server mode: the {t:'create'|'join',…} to (re)send whenever the socket opens
   code: null,
   name: '',
   net: null,
@@ -1569,8 +1573,8 @@ function mpRoundTick() {
     mpAnnounced10 = true;
     mpAnnounce(`${secs} seconds left to lock in.`);
   }
-  if (mp.role === 'host' && mp.phase === 'round' && Date.now() >= mp.roundEndsAt) {
-    hostReveal('timeout');
+  if (mp.mode === 'p2p' && mp.role === 'host' && mp.phase === 'round' && Date.now() >= mp.roundEndsAt) {
+    hostReveal('timeout');   // P2P host backstop; in server mode the server enforces this
   }
 }
 
@@ -1584,7 +1588,9 @@ function mpStartRoundClock(limitMs) {
   mpRoundClockEl().hidden = false;
   mpRenderRoundClock();
   mp.roundClock = setInterval(mpRoundTick, 500);
-  if (mp.role === 'host') {
+  if (mp.mode === 'p2p' && mp.role === 'host') {
+    // Only the P2P host arms the authoritative auto-reveal; the server owns it
+    // in server mode, so no client (owner included) schedules a local one.
     mp.roundTimer = setTimeout(() => { if (mp.phase === 'round') hostReveal('timeout'); }, limit);
   }
 }
@@ -1658,10 +1664,15 @@ function mpTeardown() {
   clearTimers();
   mpStopRoundClock();
   if (mpReconnectTimer) { clearTimeout(mpReconnectTimer); mpReconnectTimer = null; }
+  mpClearPendingServerJoin();
   if (mp.net) { try { mp.net.destroy(); } catch { /* already gone */ } }
   mp.net = null;
   mp.active = false;
   mp.role = null;
+  mp.mode = 'p2p';
+  mp.isOwner = false;
+  mp.ownerId = 'host';
+  mp.serverJoinMsg = null;
   mp.code = null;
   mp.name = '';
   mp.meId = null;
@@ -1686,7 +1697,12 @@ function mpTeardown() {
 }
 
 function mpLeave() {
-  if (mp.role === 'host' && mp.net) { try { mp.net.broadcast({ t: 'ended' }); } catch { /* ignore */ } }
+  // Only a P2P host broadcasts "ended" — it IS the room, so leaving ends it for
+  // everyone. In server mode the room outlives any single client; leaving just
+  // closes our socket and the server migrates ownership if we held it.
+  if (mp.mode === 'p2p' && mp.role === 'host' && mp.net) {
+    try { mp.net.broadcast({ t: 'ended' }); } catch { /* ignore */ }
+  }
   mpTeardown();
   mpGoHome();
 }
@@ -1746,6 +1762,9 @@ function mpBecomeHost() {
 
   mp.active = true;
   mp.role = 'host';
+  mp.mode = 'p2p';
+  mp.isOwner = true;
+  mp.ownerId = 'host';
   mp.name = name;
   mp.meId = 'host';
   mp.code = Net.generateRoomCode();
@@ -2018,20 +2037,164 @@ function hostBroadcastWaiting() {
   if (mp.role === 'host' && mp.inWaiting && mp.phase === 'round') mpRenderWaitingBoard(players);
 }
 
-/* ----- CLIENT ----- */
+/* ----- owner controls: dispatch locally (P2P host) or over the wire (server) -----
+   In the P2P star the owner IS the authoritative host, so its controls call the
+   host* functions directly. In server mode the owner is just a client that
+   happens to hold the controls; each one travels to the authoritative server as
+   an intent and the resulting room state comes back over the same socket. All
+   the owner-control UI keys off mp.isOwner (not mp.role), so one set of buttons
+   drives both transports. */
+function ownerStartRound(gameKey, spaceKey) {
+  if (mp.mode === 'server') {
+    if (mp.net) mp.net.send({ t: 'start', gameKey: gameKey, spaceKey: gameKey === 'colour' ? (spaceKey || 'rgb') : null });
+  } else {
+    hostStartRound(gameKey, spaceKey);
+  }
+}
+function ownerReveal() {
+  if (mp.mode === 'server') { if (mp.net) mp.net.send({ t: 'reveal' }); }
+  else hostReveal();
+}
+function ownerNextRound() {
+  if (mp.mode === 'server') { if (mp.net) mp.net.send({ t: 'next' }); }
+  else hostNextRound();
+}
+function ownerEndMatch() {
+  if (mp.mode === 'server') { if (mp.net) mp.net.send({ t: 'endMatch' }); }
+  else hostEndMatch();
+}
+function ownerRematch(reset) {
+  if (mp.mode === 'server') { if (mp.net) mp.net.send({ t: 'rematch', reset: !!reset }); }
+  else hostRematch(reset);
+}
+function ownerCloseRoom() {
+  if (mp.mode === 'server') {
+    if (mp.net) { try { mp.net.send({ t: 'close' }); } catch { /* torn down */ } }
+    mpTeardown();
+    mpGoHome();
+  } else {
+    hostCloseRoom();
+  }
+}
 
-function mpJoin() {
+/* ----- optional authoritative-server transport (additive; see config.js) -----
+   Server mode reuses the ENTIRE client code path below — even the owner is a
+   client from the render side, receiving welcome/lobby/round/reveal exactly
+   like everyone else. The only server-specific plumbing is (a) opening a
+   WebSocket instead of a PeerJS connection and (b) sending a create/join intent
+   on open. If any part of the server attempt fails we fall back to the P2P
+   path, so offline/LAN play is never lost — the dual-transport rule. */
+
+let mpServerHealthy = false;                 // set by the boot health probe
+let mpPendingServerJoin = null;              // { name, code, timer } while a server-join races the fallback deadline
+
+function mpClearPendingServerJoin() {
+  if (mpPendingServerJoin && mpPendingServerJoin.timer) clearTimeout(mpPendingServerJoin.timer);
+  mpPendingServerJoin = null;
+}
+/* The server welcomed us → commit to server mode; cancel the P2P fallback. */
+function mpServerJoinSucceeded() { mpClearPendingServerJoin(); }
+/* The server attempt failed (deadline / rejected / network) → discard the
+   socket and rejoin the same code over P2P. Never strand the user. */
+function mpServerJoinFallback() {
+  const p = mpPendingServerJoin;
+  mpPendingServerJoin = null;
+  if (!p) return;
+  if (p.timer) clearTimeout(p.timer);
+  if (mp.net) { try { mp.net.destroy(); } catch { /* already gone */ } mp.net = null; }
+  mpJoinP2P(p.name, p.code);
+}
+
+/* Boot probe: reveal "Host on server" only if the server answers /health.
+   A dead or unconfigured server just leaves the button hidden → pure P2P. */
+function mpInitServerMode() {
+  const btn = $('mpHostServerBtn');
+  if (!btn) return;
+  if (!Net.serverConfigured || !Net.serverConfigured()) { btn.hidden = true; return; }
+  Net.checkServerHealth(1500).then((ok) => {
+    mpServerHealthy = !!ok;
+    btn.hidden = !mpServerHealthy;
+  }).catch(() => { mpServerHealthy = false; btn.hidden = true; });
+}
+
+/* Open the WebSocket and (re)send mp.serverJoinMsg on every open. On the first
+   open that's {t:'create'} or {t:'join'}; after the welcome we rewrite it to a
+   join-by-code (see clientOnData) so a mid-game reconnect rejoins the SAME room
+   — the server reclaims our seat, and our ownership, by clientId. */
+function mpConnectServer() {
+  mp.net = Net.connectServer({
+    onNetStatus: (s) => mpSetNetStatus(s),
+    onOpen: () => {
+      if (mpReconnectTimer) { clearTimeout(mpReconnectTimer); mpReconnectTimer = null; }
+      mpSetNetStatus('online');
+      if (mp.serverJoinMsg && mp.net) mp.net.send(mp.serverJoinMsg);
+    },
+    onData: (msg) => clientOnData(msg),
+    onClose: () => { mpSetNetStatus('reconnecting'); mpScheduleClientReconnect(0); },
+    onError: (err) => mpClientError(err)
+  });
+}
+
+/* "Host on server": create an authoritative room. We connect as a client and
+   ask to create; the server names us owner and echoes it back in welcome. */
+function mpBecomeServerHost() {
   const name = mpReadName();
-  const code = Net.normalizeCode($('mpCode').value);
   if (!name) { mpSetupError('Enter a name first.'); return; }
-  if (code.length !== 4) { mpSetupError('Enter the 4-digit room code.'); return; }
-  if (!Net.available()) { mpSetupError('Multiplayer needs WebRTC, which this browser lacks.'); return; }
+  if (!Net.serverConfigured || !Net.serverConfigured()) { mpSetupError('The game server isn’t available right now.'); return; }
   mpSaveName(name);
   primeAudio();
   mpTeardown();
 
   mp.active = true;
+  mp.role = 'client';          // server mode: everyone is a client…
+  mp.mode = 'server';
+  mp.isOwner = true;           // …but we asked to create, so we expect ownership
+  mp.name = name;
+  mp.phase = 'lobby';
+  mp.serverJoinMsg = { t: 'create', name: name, clientId: mpClientId() };
+
+  mpConnectServer();
+  mpSetNetStatus('connecting');
+  $('mpCodeDisplay').textContent = '----';
+  $('mpLobbySub').textContent = 'Creating a room on the server…';
+  $('mpPlayers').innerHTML = '<p class="muted">Connecting to the server…</p>';
+  $('mpHostControls').hidden = true;
+  $('mpLobbyWait').hidden = true;
+  showMpLobby();
+}
+
+/* ----- CLIENT ----- */
+
+/* One "Join" button, two possible transports. A 4-digit code looks identical
+   whether it names a server room or a P2P room, so when the server is up we try
+   it first and fall back to P2P on any failure (mpServerJoinFallback). When the
+   server is down/unconfigured we go straight to P2P — unchanged from before. */
+function mpJoin() {
+  const name = mpReadName();
+  const code = Net.normalizeCode($('mpCode').value);
+  if (!name) { mpSetupError('Enter a name first.'); return; }
+  if (code.length !== 4) { mpSetupError('Enter the 4-digit room code.'); return; }
+  mpSaveName(name);
+  primeAudio();
+  if (mpServerHealthy && Net.serverConfigured && Net.serverConfigured()) {
+    mpJoinServer(name, code);
+  } else {
+    mpJoinP2P(name, code);
+  }
+}
+
+/* The original WebRTC join path, verbatim except that name/code validation and
+   mpSaveName/primeAudio now happen once in the mpJoin dispatcher above (and in
+   the server-fallback path, which has already run them). */
+function mpJoinP2P(name, code) {
+  if (!Net.available()) { mpSetupError('Multiplayer needs WebRTC, which this browser lacks.'); return; }
+  mpTeardown();
+
+  mp.active = true;
   mp.role = 'client';
+  mp.mode = 'p2p';
+  mp.isOwner = false;
+  mp.ownerId = 'host';
   mp.name = name;
   mp.code = code;
   mp.phase = 'lobby';
@@ -2057,16 +2220,64 @@ function mpJoin() {
   showMpLobby();
 }
 
+/* Join over the authoritative server. We race the connection against a short
+   deadline: if we don't get a welcome in time — or the server rejects the code
+   (it may actually be a P2P room) — mpServerJoinFallback retries over P2P. */
+function mpJoinServer(name, code) {
+  mpTeardown();
+
+  mp.active = true;
+  mp.role = 'client';
+  mp.mode = 'server';
+  mp.isOwner = false;
+  mp.name = name;
+  mp.code = code;
+  mp.phase = 'lobby';
+  mp.serverJoinMsg = { t: 'join', code: code, name: name, clientId: mpClientId() };
+
+  const attempt = { name: name, code: code, timer: null };
+  mpPendingServerJoin = attempt;
+  attempt.timer = setTimeout(() => {
+    if (mpPendingServerJoin === attempt) mpServerJoinFallback();
+  }, 3500);
+
+  mpConnectServer();
+  mpSetNetStatus('connecting');
+  $('mpCodeDisplay').textContent = code;
+  $('mpLobbySub').textContent = 'Connecting…';
+  $('mpPlayers').innerHTML = '<p class="muted">Connecting to the server…</p>';
+  $('mpHostControls').hidden = true;
+  $('mpLobbyWait').hidden = false;
+  showMpLobby();
+}
+
 function clientOnData(msg) {
   if (!msg || typeof msg !== 'object') return;
   switch (msg.t) {
     case 'welcome':
       mp.meId = msg.playerId;
+      if (mp.mode === 'server') {
+        // The server named us: commit the attempt (cancel the P2P fallback) and
+        // adopt the authoritative room identity. Switch the reconnect message to
+        // a join-by-code so a later drop rejoins THIS room, not a fresh one.
+        mpServerJoinSucceeded();
+        if (msg.code) mp.code = msg.code;
+        mp.isOwner = !!msg.isOwner;
+        if (msg.isOwner) mp.ownerId = mp.meId;
+        mp.serverJoinMsg = { t: 'join', code: mp.code, name: mp.name, clientId: mpClientId() };
+        renderMpLobby();
+      }
       break;
     case 'lobby':
       mp.board = msg.players || [];
       mp.phase = 'lobby';
-      $('mpLobbySub').textContent = 'Waiting for the host to start…';
+      if (mp.mode === 'server' && msg.ownerId != null) {
+        // ownerId can change if the owner drops (the server migrates it), so
+        // recompute our own owner status every lobby — the controls follow it.
+        mp.ownerId = msg.ownerId;
+        mp.isOwner = (msg.ownerId === mp.meId);
+      }
+      $('mpLobbySub').textContent = mp.isOwner ? 'Pick a challenge to start.' : 'Waiting for the host to start…';
       showMpLobby();
       renderMpLobby();
       break;
@@ -2101,8 +2312,16 @@ function clientOnData(msg) {
       mpGoHome();
       mpToast('The host closed the room.');
       break;
+    case 'denied':
+      // Soft, non-fatal refusal from the server (wrong phase, or a non-owner
+      // tried an owner action after a migration). Surface it, keep the room.
+      if (msg.message) mpToast(msg.message);
+      break;
     case 'rejected':
     case 'error':
+      // Mid server-join race, a rejection just means "not a server room" (or the
+      // server is unhappy) → fall back to P2P instead of dumping to setup.
+      if (mpPendingServerJoin) { mpServerJoinFallback(); break; }
       mpTeardown();
       mpSetupError(msg.message || 'The host closed the room.');
       showMpSetup();
@@ -2111,6 +2330,9 @@ function clientOnData(msg) {
 }
 
 function mpClientError(err) {
+  // A network error mid-race means the server isn't really reachable (a stale
+  // health check): abandon the server attempt and try P2P with the same code.
+  if (mpPendingServerJoin) { mpServerJoinFallback(); return; }
   if (Net.isRecoverableError(err)) { mpSetNetStatus('reconnecting'); mpScheduleClientReconnect(0); return; }
   mpTeardown();
   mpSetupError(Net.describeError(err));
@@ -2167,7 +2389,9 @@ function mpPlayRound(round) {
   // also still works.
   if (round.gameKey !== 'time') {
     mpStartRoundClock(round.limitMs);
-  } else if (mp.role === 'host') {
+  } else if (mp.mode === 'p2p' && mp.role === 'host') {
+    // Only the P2P host arms this locally. In server mode the server owns the
+    // Time-round auto-reveal, so no client (owner included) schedules one.
     const limit = Number(round.limitMs) > 0 ? Number(round.limitMs) : MP_ROUND_TIMEOUT_MS;
     mp.roundTimer = setTimeout(() => { if (mp.phase === 'round') hostReveal('timeout'); }, limit);
   }
@@ -2350,12 +2574,14 @@ function mpSubmit(score, guessValue) {
   if (mp.submitted) return;
   mp.submitted = true;
   if (state.sound) { state.sound.stop(); state.sound = null; }
-  if (mp.role === 'host') {
+  if (mp.mode === 'p2p' && mp.role === 'host') {
     hostRecordSubmit('host', score, guessValue);
     hostBroadcastWaiting();
     hostMaybeReveal();
     if (mp.phase === 'round') mpShowWaiting();   // reveal may already have fired
   } else {
+    // The server recomputes the score from the round params and ignores our
+    // claimed `score`; the P2P host still reads it. Send both — harmless either way.
     mp.net.send({ t: 'submit', roundNo: mp.roundNo, score: clampScore(score), guessValue });
     mpShowWaiting();
   }
@@ -2373,11 +2599,11 @@ function mpShowWaiting() {
 
   const wrap = $('mpRevealActions');
   wrap.innerHTML = '';
-  if (mp.role === 'host') {
+  if (mp.isOwner) {
     const reveal = document.createElement('button');
     reveal.className = 'btn';
     reveal.textContent = 'Reveal now';
-    reveal.addEventListener('click', () => { if (mp.phase === 'round') hostReveal(); });
+    reveal.addEventListener('click', () => { if (mp.phase === 'round') ownerReveal(); });
     wrap.appendChild(reveal);
   }
   showScreen('mp-reveal');
@@ -2574,15 +2800,15 @@ function renderMpBoard(results) {
 function renderMpRevealActions() {
   const wrap = $('mpRevealActions');
   wrap.innerHTML = '';
-  if (mp.role === 'host') {
+  if (mp.isOwner) {
     const next = document.createElement('button');
     next.className = 'btn btn--primary';
     next.textContent = 'Next round';
-    next.addEventListener('click', hostNextRound);
+    next.addEventListener('click', ownerNextRound);
     const end = document.createElement('button');
     end.className = 'btn';
     end.textContent = 'End match';
-    end.addEventListener('click', hostEndMatch);
+    end.addEventListener('click', ownerEndMatch);
     wrap.append(next, end);
   } else {
     const note = document.createElement('p');
@@ -2636,19 +2862,19 @@ function renderMpFinalBoard(results) {
 function renderMpMatchOverActions() {
   const wrap = $('mpRevealActions');
   wrap.innerHTML = '';
-  if (mp.role === 'host') {
+  if (mp.isOwner) {
     const keep = document.createElement('button');
     keep.className = 'btn btn--primary';
     keep.textContent = 'Rematch — keep scores';
-    keep.addEventListener('click', () => hostRematch(false));
+    keep.addEventListener('click', () => ownerRematch(false));
     const reset = document.createElement('button');
     reset.className = 'btn';
     reset.textContent = 'Rematch — reset scores';
-    reset.addEventListener('click', () => hostRematch(true));
+    reset.addEventListener('click', () => ownerRematch(true));
     const close = document.createElement('button');
     close.className = 'btn';
     close.textContent = 'Close room';
-    close.addEventListener('click', hostCloseRoom);
+    close.addEventListener('click', ownerCloseRoom);
     wrap.append(keep, reset, close);
   } else {
     const note = document.createElement('p');
@@ -2683,8 +2909,11 @@ function hostPlayerSnapshot() {
 
 function renderMpLobby() {
   $('mpCodeDisplay').textContent = mp.code || '----';
-  renderMpPlayerList(mp.role === 'host' ? hostPlayerSnapshot() : mp.board);
-  if (mp.role === 'host') {
+  // Only the P2P host renders from its own player Map; everyone else (P2P
+  // client, and every server-mode peer including the owner) renders the board
+  // the host/server sent us.
+  renderMpPlayerList((mp.mode === 'p2p' && mp.role === 'host') ? hostPlayerSnapshot() : mp.board);
+  if (mp.isOwner) {
     $('mpHostControls').hidden = false;
     $('mpLobbyWait').hidden = true;
     renderMpHostMode();
@@ -2699,7 +2928,7 @@ function renderMpPlayerList(players) {
   if (!players || !players.length) { wrap.innerHTML = '<p class="muted">No one here yet.</p>'; return; }
   wrap.innerHTML = players.map(p => {
     const isMe = p.id === mp.meId;
-    const isHost = p.id === 'host';
+    const isHost = p.id === mp.ownerId;   // 'host' in P2P; the owner's pid in server mode (follows migration)
     const badges = `${isHost ? '<span class="mp-badge">host</span>' : ''}${isMe ? '<span class="mp-badge mp-badge--you">you</span>' : ''}`;
     const total = typeof p.total === 'number' ? `<span class="mp-player-total">${p.total}</span>` : '';
     return `
@@ -2771,6 +3000,8 @@ function wireMpActions() {
     $('mpName').focus();
   });
   $('mpHostBtn').addEventListener('click', mpBecomeHost);
+  const hostServerBtn = $('mpHostServerBtn');
+  if (hostServerBtn) hostServerBtn.addEventListener('click', mpBecomeServerHost);
   $('mpJoinBtn').addEventListener('click', mpJoin);
   $('mpCode').addEventListener('input', (e) => { e.target.value = Net.normalizeCode(e.target.value); });
   $('mpName').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('mpCode').focus(); } });
@@ -2778,9 +3009,9 @@ function wireMpActions() {
   $('mpCopyCode').addEventListener('click', () => { if (mp.code) mpCopy(mp.code, 'mpCopyCode'); });
   $('mpCopyLink').addEventListener('click', () => { if (mp.code) mpCopy(mpShareLink(), 'mpCopyLink'); });
   $('mpStartBtn').addEventListener('click', () => {
-    if (mp.role !== 'host' || !mp.pickedGame) return;
+    if (!mp.isOwner || !mp.pickedGame) return;
     primeAudio();
-    hostStartRound(mp.pickedGame, mp.pickedSpace);
+    ownerStartRound(mp.pickedGame, mp.pickedSpace);
   });
 }
 
@@ -2902,6 +3133,7 @@ function boot() {
   renderModeCards();
   wireActions();
   wireMpActions();
+  mpInitServerMode();     // async health probe; reveals "Host on server" if up
   showScreen('home');
   mpConsumeInviteParam();
 }

@@ -61,6 +61,9 @@
         </label>
         <div class="mp-setup-actions">
           <button class="btn btn--primary" id="mpHostBtn" type="button">Host a room</button>
+          <!-- Revealed by script.js only after a successful server health probe
+               (see config.js / mpInitServerMode). Stays hidden → pure P2P. -->
+          <button class="btn btn--primary mp-host-server" id="mpHostServerBtn" type="button" hidden>Host on server</button>
           <div class="mp-join">
             <input id="mpCode" type="text" inputmode="numeric" maxlength="4" placeholder="Code" aria-label="Room code" />
             <button class="btn" id="mpJoinBtn" type="button">Join</button>
@@ -187,6 +190,10 @@
     <span class="muted">gamut · a suite of static perception games</span>
   </footer>
 
+  <!-- config.js exposes window.GamutConfig (server endpoints) and MUST load
+       before net.js/script.js. Server mode is additive; if it's absent or the
+       health probe fails, the app stays on the peer-to-peer path. -->
+  <script src="config.js"></script>
   <script src="net.js"></script>
   <script src="script.js"></script>
 </body>

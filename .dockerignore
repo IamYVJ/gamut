@@ -1,0 +1,23 @@
+# The server image is built with the REPO ROOT as its Docker build context
+# (it needs the root-level engine.js — see server/Dockerfile). This keeps the
+# context tarball small and stops junk from ever reaching a layer. The
+# Dockerfile COPYs are explicit (engine.js + server/), so the client files
+# below are excluded only to slim the context, not for correctness.
+.git
+.github
+.claude
+
+# never ship a host-built dependency tree; the image installs its own
+node_modules
+**/node_modules
+npm-debug.log*
+
+# client-only assets — irrelevant to the server image
+index.html
+styles.css
+script.js
+net.js
+config.js
+scripts
+*.md
+LICENSE

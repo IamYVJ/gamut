@@ -167,6 +167,107 @@
   }
 
   // ---------------------------------------------------------------------------
+  // SERVER (authoritative WebSocket) — OPTIONAL, additive transport.
+  //
+  // A thin wrapper over the native WebSocket that mirrors the joinHost() client
+  // surface ({ send, isOpen, reconnect, destroy }) so script.js can drive a
+  // server connection and a P2P connection through the same call sites. Every
+  // endpoint comes from window.GamutConfig (see config.js); if that global is
+  // absent/blank, serverConfigured() is false and callers stay on P2P.
+  // ---------------------------------------------------------------------------
+  function serverUrl() {
+    const c = global.GamutConfig;
+    return (c && typeof c.SERVER_URL === 'string') ? c.SERVER_URL.trim() : '';
+  }
+  function serverHealthUrl() {
+    const c = global.GamutConfig;
+    return (c && typeof c.SERVER_HEALTH === 'string') ? c.SERVER_HEALTH.trim() : '';
+  }
+  // Whether server mode is even POSSIBLE (endpoints set + WebSocket exists).
+  // This is a capability check, not a liveness check — see checkServerHealth.
+  function serverConfigured() {
+    return !!(serverUrl() && serverHealthUrl() && global.WebSocket);
+  }
+
+  // One-shot liveness probe. Resolves true only on a real ok response from
+  // /health; any error, non-ok status, or timeout resolves false (never
+  // rejects) so callers can simply `if (ok) revealButton()`. AbortController
+  // keeps a dead host from hanging the boot path.
+  function checkServerHealth(timeoutMs) {
+    const url = serverHealthUrl();
+    if (!url || typeof global.fetch !== 'function') return Promise.resolve(false);
+    const ms = timeoutMs > 0 ? timeoutMs : 1500;
+    let timer = null;
+    let ctrl = null;
+    try { ctrl = new AbortController(); } catch (_) { ctrl = null; }
+    const opts = { method: 'GET', mode: 'cors', cache: 'no-store' };
+    if (ctrl) {
+      opts.signal = ctrl.signal;
+      timer = setTimeout(function () { try { ctrl.abort(); } catch (_) {} }, ms);
+    }
+    return global.fetch(url, opts)
+      .then(function (r) { if (timer) clearTimeout(timer); return !!(r && r.ok); })
+      .catch(function () { if (timer) clearTimeout(timer); return false; });
+  }
+
+  // Open a WebSocket to the server. Returns the SAME shape as joinHost() so the
+  // client engine can treat either transport polymorphically:
+  //   send(msg)     JSON-encode + send when OPEN (dropped otherwise, matching
+  //                 trySend's best-effort P2P semantics)
+  //   isOpen()      readyState === OPEN
+  //   reconnect()   dial a fresh socket if the current one is closed/closing
+  //   destroy()     intentional teardown — suppresses the onClose callback so a
+  //                 deliberate leave isn't mistaken for a dropped connection
+  function connectServer(handlers = {}) {
+    let ws = null;
+    let manualClose = false;
+
+    const open = () => {
+      const url = serverUrl();
+      if (!url) { handlers.onError && handlers.onError({ type: 'network' }); return; }
+      try { ws = new global.WebSocket(url); }
+      catch (_) { handlers.onError && handlers.onError({ type: 'network' }); return; }
+
+      ws.onopen = () => {
+        handlers.onNetStatus && handlers.onNetStatus('online');
+        handlers.onOpen && handlers.onOpen();
+      };
+      ws.onmessage = (ev) => {
+        const msg = safeParse(ev && ev.data);
+        if (msg) handlers.onData && handlers.onData(msg);
+      };
+      ws.onclose = () => {
+        if (!manualClose) handlers.onClose && handlers.onClose();
+      };
+      // The WebSocket error event carries no useful detail; normalise it to the
+      // recoverable {type:'network'} shape net.js's helpers already understand.
+      ws.onerror = () => { handlers.onError && handlers.onError({ type: 'network' }); };
+    };
+
+    open();
+
+    return {
+      get socket() { return ws; },
+      send(msg) {
+        if (ws && ws.readyState === 1 /* OPEN */) {
+          try { ws.send(JSON.stringify(msg)); } catch (_) { /* torn down mid-send */ }
+        }
+      },
+      isOpen() { return !!(ws && ws.readyState === 1); },
+      reconnect() {
+        if (manualClose) return;
+        // Already connecting or open — nothing to do.
+        if (ws && (ws.readyState === 0 /* CONNECTING */ || ws.readyState === 1 /* OPEN */)) return;
+        open();
+      },
+      destroy() {
+        manualClose = true;
+        try { if (ws) ws.close(); } catch (_) {}
+      },
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Error helpers
   // ---------------------------------------------------------------------------
   function isRecoverableError(err) {
@@ -196,5 +297,7 @@
   global.Net = {
     PEER_PREFIX, peerIdForCode, generateRoomCode, normalizeCode,
     available, createHost, joinHost, isRecoverableError, describeError,
+    // OPTIONAL server transport (additive; no-op unless config.js is set).
+    serverUrl, serverHealthUrl, serverConfigured, checkServerHealth, connectServer,
   };
 })(window);
