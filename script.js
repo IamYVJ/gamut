@@ -2149,6 +2149,11 @@ function mpPlayRound(round) {
   mp.revealShown = false;
   state.gameKey = null;          // MP never records to localStorage
   clearTimers();
+  // Drop any countdown pill/timer left over from a prior round *before* the new
+  // one renders. Without this, a missed reveal (dropped packet / reconnect)
+  // could leave a stale ticking pill bleeding into — of all rounds — a Time
+  // round, leaking the very duration the player is meant to estimate.
+  mpStopRoundClock();
 
   const play = {
     colour: mpPlayColour, time: mpPlayTime, count: mpPlayCount,
@@ -2163,7 +2168,6 @@ function mpPlayRound(round) {
   if (round.gameKey !== 'time') {
     mpStartRoundClock(round.limitMs);
   } else if (mp.role === 'host') {
-    mpStopRoundClock();
     const limit = Number(round.limitMs) > 0 ? Number(round.limitMs) : MP_ROUND_TIMEOUT_MS;
     mp.roundTimer = setTimeout(() => { if (mp.phase === 'round') hostReveal('timeout'); }, limit);
   }
@@ -2806,7 +2810,16 @@ function wireActions() {
     }
   });
 
-  $('respondSubmit').addEventListener('click', () => { if (state.submit) state.submit(); });
+  // Fire the submit at most once per round. A fast double-click on "Lock in"
+  // would otherwise run the scorer + recordScore twice, inflating the
+  // single-player play count and average. runRespond re-arms state.submit for
+  // the next round, so nulling it here is safe.
+  $('respondSubmit').addEventListener('click', () => {
+    if (!state.submit) return;
+    const fn = state.submit;
+    state.submit = null;
+    fn();
+  });
   $('resultSecondary').addEventListener('click', () => { if (state.secondary) state.secondary(); });
 
   // Reset scores — a two-step inline confirm (no blocking dialog). First click
@@ -2853,12 +2866,14 @@ function initTheme() {
   const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
   const theme = saved || (prefersDark ? 'dark' : 'light');
   document.documentElement.setAttribute('data-theme', theme);
+  $('themeToggle').setAttribute('aria-pressed', String(theme === 'dark'));
 
   $('themeToggle').addEventListener('click', () => {
     const cur = document.documentElement.getAttribute('data-theme');
     const next = cur === 'dark' ? 'light' : 'dark';
     document.documentElement.setAttribute('data-theme', next);
     localStorage.setItem('gamut-theme', next);
+    $('themeToggle').setAttribute('aria-pressed', String(next === 'dark'));
   });
 }
 
