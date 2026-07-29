@@ -68,7 +68,11 @@
             <input id="mpCode" type="text" inputmode="numeric" maxlength="4" placeholder="Code" aria-label="Room code" />
             <button class="btn" id="mpJoinBtn" type="button">Join</button>
           </div>
+          <!-- Watch-only display for casting a room to a big screen: enter the
+               code above, then Watch on TV. Never plays or submits. -->
+          <button class="btn btn--ghost mp-watch" id="mpWatchBtn" type="button">📺 Watch on TV</button>
         </div>
+        <p class="mp-watch-hint muted">Watching casts the room to a screen — the challenge, who’s locked in, and the scores. It never plays.</p>
         <p class="mp-error" id="mpSetupError" aria-live="polite" hidden></p>
       </div>
     </section>

@@ -39,6 +39,10 @@ var Engine = require('../engine.js');
 /* Mirror script.js's MP_ROUND_TIMEOUT_MS / MP_REJOIN_GRACE_MS. */
 var ROUND_TIMEOUT_MS = 60000;
 var REJOIN_GRACE_MS = 20000;
+/* TV spectators are passive viewers (cast a room to a screen): they receive
+   every broadcast but are never seated, never scored, never own, and can't
+   drive the match. Capped per-room so a room can't be flooded with watchers. */
+var MAX_SPECTATORS = 8;
 /* A room with nobody connected is kept this long (so a dropped table can be
    reclaimed by clientId), then garbage-collected. */
 var IDLE_ROOM_MS = 15 * 60 * 1000;
@@ -75,8 +79,10 @@ function Room(code, opts) {
   this._clock = opts.clock || REAL_CLOCK;
   this.roundTimeoutMs = opts.roundTimeoutMs > 0 ? opts.roundTimeoutMs : ROUND_TIMEOUT_MS;
   this.rejoinGraceMs = opts.rejoinGraceMs >= 0 ? opts.rejoinGraceMs : REJOIN_GRACE_MS;
+  this.maxSpectators = opts.maxSpectators > 0 ? opts.maxSpectators : MAX_SPECTATORS;
 
   this.players = new Map();      // pid -> { id,name,clientId,total,connected,roundScore,submitted,guessValue }
+  this.spectators = new Map();   // pid -> { id,clientId,name } — passive viewers, no seat/score/ownership
   this.ownerId = null;           // pid of the current owner
   this.phase = 'lobby';          // 'lobby' | 'round' | 'reveal' | 'ended'
   this.roundNo = 0;
@@ -95,6 +101,9 @@ function Room(code, opts) {
 Room.prototype.sendTo = function (pid, msg) { this._send(pid, msg); };
 Room.prototype.broadcast = function (msg) {
   for (var pid of this.players.keys()) this._send(pid, msg);
+  // Spectators mirror players for every broadcast (round / reveal / waiting /
+  // lobby / matchover / ended) — that's the whole point of a TV view.
+  for (var sid of this.spectators.keys()) this._send(sid, msg);
 };
 Room.prototype.touch = function () { this.lastActivityAt = this._clock.now(); };
 Room.prototype._isOwner = function (pid) { return pid === this.ownerId; };
@@ -165,6 +174,52 @@ Room.prototype.join = function (pid, info) {
     return;
   }
   if (this.phase === 'round') this._rejoinRound(pid, reclaimed);
+};
+
+/* Attach a passive TV spectator: it receives every broadcast but is never
+   seated, scored, or an owner (a stray submit/owner intent from a spectator is
+   harmlessly refused downstream — submit() needs a participant seat, owner
+   intents need ownerId). Reclaim-by-clientId keeps a page refresh from
+   double-counting the watcher. Returns {error:'spectators-full'} at the cap. */
+Room.prototype.spectate = function (pid, info) {
+  // Drop any prior spectator seat with the same clientId (refresh dedup).
+  for (var entry of this.spectators) {
+    var sid = entry[0], sp = entry[1];
+    if (sp.clientId === info.clientId) { if (sid !== pid) this.spectators.delete(sid); break; }
+  }
+  if (!this.spectators.has(pid) && this.spectators.size >= this.maxSpectators) {
+    return { error: 'spectators-full' };
+  }
+  this.spectators.set(pid, { id: pid, clientId: info.clientId, name: info.name || 'TV' });
+  this.touch();
+  this._welcomeSpectator(pid);
+
+  if (this.phase === 'lobby') {
+    // A single broadcast refreshes everyone's watcher count and rosters the new TV.
+    this.broadcastLobby();
+  } else {
+    // Mid-match: give the TV a TARGETED snapshot + catch-up so we don't push a
+    // stray 'lobby'/'waiting' at the players (their client keys lobby to phase).
+    this.sendTo(pid, this._lobbyPayload());
+    if ((this.phase === 'reveal' || this.phase === 'ended') && this.lastReveal) {
+      this.sendTo(pid, this.lastReveal);
+    } else if (this.phase === 'round') {
+      this.sendTo(pid, {
+        t: 'round', roundNo: this.roundNo, gameKey: this.gameKey,
+        spaceKey: this.spaceKey, params: this.params, limitMs: this.roundTimeoutMs
+      });
+      this.sendTo(pid, this._waitingPayload());
+    }
+  }
+  return { ok: true };
+};
+
+Room.prototype._welcomeSpectator = function (pid) {
+  var owner = this.players.get(this.ownerId);
+  this.sendTo(pid, {
+    t: 'welcome', playerId: pid, code: this.code,
+    hostName: owner ? owner.name : '', isOwner: false, spectator: true
+  });
 };
 
 /* A player who dropped mid-round can rejoin and still play, provided they were
@@ -349,6 +404,12 @@ Room.prototype._clearTimeout = function () {
 /* ----- disconnect + owner migration ----- */
 
 Room.prototype.disconnect = function (pid) {
+  if (this.spectators.has(pid)) {       // a TV left — no seat/score to retain
+    this.spectators.delete(pid);
+    this.touch();
+    if (this.phase === 'lobby') this.broadcastLobby();   // refresh the watcher count
+    return;
+  }
   var pl = this.players.get(pid);
   if (!pl) return;
   pl.connected = false;                 // keep the seat so a reconnect can reclaim it
@@ -371,22 +432,28 @@ Room.prototype._migrateOwner = function () {
 
 /* ----- broadcasts + snapshots ----- */
 
-Room.prototype.broadcastLobby = function () {
+/* Snapshot builders — shared by the broadcasts and by a spectator's targeted
+   catch-up (so a mid-round watcher gets the current roster/board without a
+   broadcast that would disturb the players). `spectators` is an additive field
+   the pass-2 client ignores; the TV view uses it for a watcher count. */
+Room.prototype._lobbyPayload = function () {
   var players = [];
   for (var pl of this.players.values()) {
     players.push({ id: pl.id, name: pl.name, total: pl.total, connected: pl.connected });
   }
-  this.broadcast({ t: 'lobby', code: this.code, players: players, phase: this.phase, ownerId: this.ownerId });
+  return { t: 'lobby', code: this.code, players: players, phase: this.phase, ownerId: this.ownerId, spectators: this.spectators.size };
 };
-
-Room.prototype.broadcastWaiting = function () {
+Room.prototype._waitingPayload = function () {
   var players = [];
   for (var pid of this.roundParticipants) {
     var pl = this.players.get(pid);
     if (pl) players.push({ id: pl.id, name: pl.name, submitted: pl.submitted, connected: pl.connected });
   }
-  this.broadcast({ t: 'waiting', roundNo: this.roundNo, players: players });
+  return { t: 'waiting', roundNo: this.roundNo, players: players };
 };
+
+Room.prototype.broadcastLobby = function () { this.broadcast(this._lobbyPayload()); };
+Room.prototype.broadcastWaiting = function () { this.broadcast(this._waitingPayload()); };
 
 Room.prototype._standings = function () {
   var results = [];
@@ -413,7 +480,8 @@ function RoomManager(opts) {
     send: this._send,
     clock: this._clock,
     roundTimeoutMs: opts.roundTimeoutMs,
-    rejoinGraceMs: opts.rejoinGraceMs
+    rejoinGraceMs: opts.rejoinGraceMs,
+    maxSpectators: opts.maxSpectators
   };
   this.rooms = new Map();     // code -> Room
   this.pidRoom = new Map();   // pid  -> code (one room per connection)
@@ -456,6 +524,19 @@ RoomManager.prototype.joinRoom = function (pid, code, info) {
   return { code: code, room: room };
 };
 
+/* Attach a passive TV spectator to an existing room. Binds the pid only on
+   success, so a full room (spectators-full) leaves the connection unbound and
+   free to retry. Spectating never creates a room. */
+RoomManager.prototype.spectateRoom = function (pid, code, info) {
+  if (this.pidRoom.has(pid)) return { error: 'already-in-room' };
+  var room = this.rooms.get(code);
+  if (!room || room.closed) return { error: 'no-room' };
+  var res = room.spectate(pid, info);
+  if (res && res.error) return res;      // e.g. spectators-full — do NOT bind
+  this.pidRoom.set(pid, code);
+  return { code: code, room: room };
+};
+
 /* Route a per-player intent (submit / owner controls) to that pid's room. */
 RoomManager.prototype.dispatch = function (pid, method, arg) {
   var room = this.roomOf(pid);
@@ -483,6 +564,9 @@ RoomManager.prototype._destroy = function (code) {
   for (var pid of room.players.keys()) {
     if (this.pidRoom.get(pid) === code) this.pidRoom.delete(pid);
   }
+  for (var sid of room.spectators.keys()) {
+    if (this.pidRoom.get(sid) === code) this.pidRoom.delete(sid);
+  }
   this.rooms.delete(code);
 };
 
@@ -508,5 +592,6 @@ module.exports = {
   makeCode: makeCode,
   ROUND_TIMEOUT_MS: ROUND_TIMEOUT_MS,
   REJOIN_GRACE_MS: REJOIN_GRACE_MS,
-  IDLE_ROOM_MS: IDLE_ROOM_MS
+  IDLE_ROOM_MS: IDLE_ROOM_MS,
+  MAX_SPECTATORS: MAX_SPECTATORS
 };

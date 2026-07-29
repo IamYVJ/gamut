@@ -66,7 +66,8 @@ function makeRig(opts) {
     send: send, clock: clock,
     roundTimeoutMs: opts.roundTimeoutMs,
     rejoinGraceMs: opts.rejoinGraceMs,
-    idleMs: opts.idleMs
+    idleMs: opts.idleMs,
+    maxSpectators: opts.maxSpectators
   });
   var seq = 0;
   function client(sessOpts) {
@@ -401,6 +402,121 @@ function testOwnerMigration() {
   eq(room.ownerId, bob.pid, 'a live migrated owner is not displaced by the returnee');
 }
 
+/* ============================================================
+   12. TV spectator: watches everything, scores nothing, drives nothing
+   ============================================================ */
+function testSpectator() {
+  section('12. Spectator sees the match but is never seated, scored, or in control');
+  var rig = makeRig();
+  var alice = rig.client(); var bob = rig.client();
+  alice.send({ t: 'create', name: 'Alice', clientId: 'ca' });
+  var code = alice.last('welcome').code;
+  bob.send({ t: 'join', code: code, name: 'Bob', clientId: 'cb' });
+  var room = rig.manager.rooms.get(code);
+
+  // A TV attaches while the room is in the lobby.
+  var tv = rig.client();
+  tv.send({ t: 'spectate', code: code, name: 'Living Room', clientId: 'tv1' });
+  var w = tv.last('welcome');
+  ok(w && w.spectator === true, 'spectator welcome carries spectator:true');
+  ok(w && w.isOwner === false, 'spectator is never owner');
+  ok(!room.players.has(tv.pid), 'spectator is NOT seated as a player');
+  ok(room.spectators.has(tv.pid), 'spectator is tracked in the spectator map');
+  var lob = tv.last('lobby');
+  ok(lob && lob.players.length === 2, 'spectator sees the 2-player roster');
+  eq(lob && lob.spectators, 1, 'lobby advertises the watcher count');
+  var aliceLob = alice.last('lobby');
+  eq(aliceLob && aliceLob.spectators, 1, 'players also see the watcher count');
+
+  // Owner starts a round — the spectator receives the stimulus broadcast…
+  alice.send({ t: 'start', gameKey: 'tempo' });
+  var tvRound = tv.last('round');
+  ok(!!tvRound, 'spectator receives the round (the challenge) broadcast');
+  ok(!room.roundParticipants.has(tv.pid), 'spectator is NOT a round participant');
+
+  // …but a spectator submit is ignored, and the reveal does NOT wait on the TV.
+  var bpm = roundParams(alice).bpm;
+  tv.send({ t: 'submit', roundNo: 1, guessValue: bpm });   // should be a no-op
+  ok(!room.players.has(tv.pid), 'a spectator submit does not create a seat');
+  eq(room.phase, 'round', 'spectator submit does not itself trigger a reveal');
+
+  alice.send({ t: 'submit', roundNo: 1, guessValue: bpm });
+  bob.send({ t: 'submit', roundNo: 1, guessValue: bpm });
+  var reveal = tv.last('reveal');
+  ok(!!reveal, 'spectator receives the reveal broadcast');
+  ok(!rowOf(reveal.results, tv.pid), 'spectator is absent from the scored results');
+  eq(reveal.results.length, 2, 'only the 2 real players are scored');
+
+  // A spectator cannot drive the match.
+  tv.clear();
+  tv.send({ t: 'start', gameKey: 'angle' });
+  tv.send({ t: 'endMatch' });
+  tv.send({ t: 'close' });
+  eq(tv.count('round'), 0, 'spectator start is refused (no new round)');
+  ok(rig.manager.rooms.has(code), 'spectator close does not tear down the room');
+}
+
+/* ============================================================
+   13. Spectator: mid-match catch-up, cap, reclaim, disconnect cleanup
+   ============================================================ */
+function testSpectatorLifecycle() {
+  section('13. Spectator catch-up / cap / clientId reclaim / disconnect cleanup');
+
+  // -- mid-round catch-up: a TV that attaches during a round gets stimulus+board
+  var rig = makeRig();
+  var alice = rig.client(); var bob = rig.client();
+  alice.send({ t: 'create', name: 'Alice', clientId: 'ca' });
+  var code = alice.last('welcome').code;
+  bob.send({ t: 'join', code: code, name: 'Bob', clientId: 'cb' });
+  alice.send({ t: 'start', gameKey: 'tempo' });
+  var bpm = roundParams(alice).bpm;
+  alice.send({ t: 'submit', roundNo: 1, guessValue: bpm });   // 1 of 2 locked in
+
+  var tv = rig.client();
+  tv.send({ t: 'spectate', code: code, name: 'TV', clientId: 'tv1' });
+  ok(tv.last('round'), 'mid-round spectator is caught up with the current challenge');
+  var wb = tv.last('waiting');
+  ok(wb && wb.players.length === 2, 'mid-round spectator gets the current waiting board');
+  var room = rig.manager.rooms.get(code);
+  eq(room.phase, 'round', 'attaching a spectator mid-round does not disturb the phase');
+
+  // -- reveal-phase catch-up: a TV that attaches after the reveal sees results
+  bob.send({ t: 'submit', roundNo: 1, guessValue: bpm });     // triggers reveal
+  eq(room.phase, 'reveal', 'round revealed once both players submit');
+  var tv2 = rig.client();
+  tv2.send({ t: 'spectate', code: code, name: 'TV2', clientId: 'tv2' });
+  var late = tv2.last('reveal');
+  ok(late && late.results.length === 2, 'reveal-phase spectator catches up on the last reveal');
+
+  // -- clientId reclaim: same TV re-spectating does not double-count
+  eq(room.spectators.size, 2, 'two distinct spectators are counted');
+  tv2.send({ t: 'spectate', code: code, name: 'TV2', clientId: 'tv2' });  // same clientId
+  // (second spectate from the same live socket is refused as already-in-room;
+  //  the reclaim path is exercised by a NEW socket bearing the same clientId)
+  tv2.close();
+  var tv2b = rig.client();
+  tv2b.send({ t: 'spectate', code: code, name: 'TV2', clientId: 'tv2' });
+  eq(room.spectators.size, 2, 'same clientId reclaims its watcher slot (no phantom)');
+
+  // -- disconnect cleanup: a TV leaving frees its slot and the pid binding
+  tv.close();
+  ok(!room.spectators.has(tv.pid), 'disconnecting spectator is removed from the map');
+  ok(!rig.manager.pidRoom.has(tv.pid), 'disconnecting spectator frees its pid binding');
+
+  // -- cap: with a max of 2 watchers, a 3rd is refused (and stays unbound)
+  var rig2 = makeRig({ maxSpectators: 2 });
+  var host = rig2.client();
+  host.send({ t: 'create', name: 'Host', clientId: 'ch' });
+  var code2 = host.last('welcome').code;
+  var s1 = rig2.client(); s1.send({ t: 'spectate', code: code2, name: 'A', clientId: 's1' });
+  var s2 = rig2.client(); s2.send({ t: 'spectate', code: code2, name: 'B', clientId: 's2' });
+  var s3 = rig2.client(); s3.send({ t: 'spectate', code: code2, name: 'C', clientId: 's3' });
+  var room2 = rig2.manager.rooms.get(code2);
+  eq(room2.spectators.size, 2, 'spectator cap is enforced');
+  ok(s3.last('rejected'), 'the over-cap spectator is told the room is full');
+  ok(!rig2.manager.pidRoom.has(s3.pid), 'a refused spectator is left unbound (free to retry)');
+}
+
 /* ---------- run all ---------- */
 function run() {
   console.log('gamut server — headless authoritative-logic tests');
@@ -415,6 +531,8 @@ function run() {
   testRobustness();
   testEndAndClose();
   testOwnerMigration();
+  testSpectator();
+  testSpectatorLifecycle();
 
   console.log('\n----------------------------------------');
   console.log(passed + ' passed, ' + failed + ' failed');

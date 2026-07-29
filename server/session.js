@@ -24,6 +24,7 @@
    Wire intents (client → server):
      create {name,clientId}                  → make a room, become owner
      join   {code,name,clientId}             → join / reconnect into a room
+     spectate {code,name,clientId}           → attach a passive TV viewer
      submit {roundNo,guessValue}             → guess (score recomputed server-side)
      start  {gameKey,spaceKey}  (owner)      → begin a round
      reveal                     (owner)      → reveal now
@@ -119,6 +120,7 @@ Session.prototype._route = function (msg) {
   switch (msg.t) {
     case 'create':   return this._create(msg);
     case 'join':     return this._join(msg);
+    case 'spectate': return this._spectate(msg);
     case 'submit':   return this._submit(msg);
     case 'start':    return this._start(msg);
     case 'reveal':   return this._owner('revealNow', undefined);
@@ -143,6 +145,15 @@ Session.prototype._join = function (msg) {
   if (code.length !== CODE_LEN) { this._rejected('Enter the 4-digit room code.'); return; }
   var info = { name: sanitizeName(msg.name), clientId: this._clientId(msg.clientId) };
   var res = this.manager.joinRoom(this.pid, code, info);
+  if (res && res.error) this._rejected(this._errText(res.error));
+};
+
+Session.prototype._spectate = function (msg) {
+  if (this.manager.roomOf(this.pid)) { this._denied('You are already in a room.'); return; }
+  var code = normalizeCode(msg.code);
+  if (code.length !== CODE_LEN) { this._rejected('Enter the 4-digit room code.'); return; }
+  var info = { name: sanitizeName(msg.name), clientId: this._clientId(msg.clientId) };
+  var res = this.manager.spectateRoom(this.pid, code, info);
   if (res && res.error) this._rejected(this._errText(res.error));
 };
 
@@ -189,6 +200,7 @@ Session.prototype._errText = function (code) {
     case 'server-full':     return 'The server is full — try again shortly.';
     case 'no-code':         return "Couldn't allocate a room code — try again.";
     case 'no-room':         return 'No game found with that code. Check it and that the host is still hosting.';
+    case 'spectators-full': return 'This room already has the maximum number of TV viewers.';
     default:                return 'Could not complete that request.';
   }
 };

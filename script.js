@@ -1336,6 +1336,8 @@ const MP_CLIENT_KEY = 'gamut-mp-clientId';
    rejoin and still play, as long as they're back within the grace window. */
 const MP_ROUND_TIMEOUT_MS = 60000;
 const MP_REJOIN_GRACE_MS = 20000;
+/* Passive TV viewers per room (mirrors server/rooms.js MAX_SPECTATORS). */
+const MP_MAX_SPECTATORS = 8;
 
 const mp = {
   active: false,
@@ -1343,7 +1345,9 @@ const mp = {
   mode: 'p2p',           // 'p2p' (WebRTC star) | 'server' (authoritative WebSocket)
   isOwner: false,        // do I hold the owner controls? (p2p host, or server room owner)
   ownerId: 'host',       // id of the owner seat: 'host' in p2p, a server pid in server mode
-  serverJoinMsg: null,   // server mode: the {t:'create'|'join',…} to (re)send whenever the socket opens
+  spectator: false,      // am I a passive TV viewer? (watch-only: never seated/scored/owner)
+  spectatorCount: 0,     // how many TVs are watching this room (shown in the lobby)
+  serverJoinMsg: null,   // server mode: the {t:'create'|'join'|'spectate',…} to (re)send whenever the socket opens
   code: null,
   name: '',
   net: null,
@@ -1357,6 +1361,7 @@ const mp = {
   inWaiting: false,
   revealShown: false,
   players: new Map(),    // id -> { id,name,clientId,total,connected,roundScore,submitted,guessValue }
+  spectators: new Set(), // P2P host: connIds watching passively (never seated/scored)
   roundParticipants: new Set(),
   board: [],             // client's copy of the lobby/leaderboard players
   waiting: [],           // client's copy of the per-round submit statuses
@@ -1672,6 +1677,9 @@ function mpTeardown() {
   mp.mode = 'p2p';
   mp.isOwner = false;
   mp.ownerId = 'host';
+  mp.spectator = false;
+  mp.spectatorCount = 0;
+  try { document.body.classList.remove('tv-mode'); } catch { /* no DOM */ }
   mp.serverJoinMsg = null;
   mp.code = null;
   mp.name = '';
@@ -1685,6 +1693,7 @@ function mpTeardown() {
   mp.inWaiting = false;
   mp.revealShown = false;
   mp.players = new Map();
+  mp.spectators = new Set();
   mp.roundParticipants = new Set();
   mp.board = [];
   mp.waiting = [];
@@ -1805,6 +1814,8 @@ function hostOnData(connId, msg) {
   if (!msg || typeof msg !== 'object') return;
   if (msg.t === 'join') {
     hostOnJoin(connId, msg);
+  } else if (msg.t === 'spectate') {
+    hostOnSpectate(connId, msg);
   } else if (msg.t === 'submit') {
     if (mp.phase !== 'round' || msg.roundNo !== mp.roundNo) return;
     if (!mp.roundParticipants.has(connId)) return;   // mid-round joiner isn't in this round
@@ -1883,7 +1894,46 @@ function hostRejoinRound(connId, reclaimed) {
   }
 }
 
+/* Attach a passive TV spectator (P2P mirror of rooms.js Room.spectate). It
+   receives every broadcast but is never in mp.players, never a round
+   participant, never scored, and can't drive the match (a stray submit/owner
+   frame is refused: submit needs a player seat, owner intents need the host).
+   Capped so a room can't be flooded with viewers. */
+function hostOnSpectate(connId, msg) {
+  if (!mp.spectators.has(connId) && mp.spectators.size >= MP_MAX_SPECTATORS) {
+    try { mp.net.sendTo(connId, { t: 'rejected', message: 'This room already has the maximum number of TV viewers.' }); } catch { /* ignore */ }
+    return;
+  }
+  mp.spectators.add(connId);
+
+  mp.net.sendTo(connId, {
+    t: 'welcome', playerId: connId, code: mp.code,
+    hostName: mp.players.get('host').name, isOwner: false, spectator: true
+  });
+  // Targeted lobby snapshot: roster the room without a broadcast that would
+  // disturb the players mid-round.
+  mp.net.sendTo(connId, hostLobbyPayload());
+  // Catch the TV up to whatever's happening right now.
+  if ((mp.phase === 'reveal' || mp.phase === 'ended') && mp.lastReveal) {
+    mp.net.sendTo(connId, mp.lastReveal);
+  } else if (mp.phase === 'round') {
+    mp.net.sendTo(connId, {
+      t: 'round', roundNo: mp.roundNo, gameKey: mp.gameKey,
+      spaceKey: mp.spaceKey, params: mp.params, limitMs: MP_ROUND_TIMEOUT_MS
+    });
+    mp.net.sendTo(connId, hostWaitingPayload());
+  }
+  // Refresh the watcher count — but only in the lobby (no stray 'lobby' at
+  // players mid-round; mirrors the server).
+  if (mp.phase === 'lobby') { hostBroadcastLobby(); renderMpLobby(); }
+}
+
 function hostOnDisconnect(connId) {
+  if (mp.spectators.has(connId)) {      // a TV left — no seat/score to retain
+    mp.spectators.delete(connId);
+    if (mp.phase === 'lobby') { hostBroadcastLobby(); renderMpLobby(); }
+    return;
+  }
   const pl = mp.players.get(connId);
   if (!pl) return;
   pl.connected = false;                 // keep the seat so a reconnect can reclaim it
@@ -2017,24 +2067,32 @@ function hostCloseRoom() {
   mpGoHome();
 }
 
-function hostBroadcastLobby() {
+/* Snapshot builders — shared by the broadcasts and by a spectator's targeted
+   catch-up. P2P lobby carries NO ownerId (the client infers 'host'); the
+   additive `spectators` count is the number of TVs watching. */
+function hostLobbyPayload() {
   const players = [];
   for (const pl of mp.players.values()) {
     players.push({ id: pl.id, name: pl.name, total: pl.total, connected: pl.connected });
   }
-  mp.net.broadcast({ t: 'lobby', code: mp.code, players, phase: mp.phase });
+  return { t: 'lobby', code: mp.code, players, phase: mp.phase, spectators: mp.spectators.size };
 }
-
-function hostBroadcastWaiting() {
+function hostWaitingPayload() {
   const players = [];
   for (const id of mp.roundParticipants) {
     const pl = mp.players.get(id);
     if (pl) players.push({ id: pl.id, name: pl.name, submitted: pl.submitted, connected: pl.connected });
   }
-  const msg = { t: 'waiting', roundNo: mp.roundNo, players };
+  return { t: 'waiting', roundNo: mp.roundNo, players };
+}
+
+function hostBroadcastLobby() { mp.net.broadcast(hostLobbyPayload()); }
+
+function hostBroadcastWaiting() {
+  const msg = hostWaitingPayload();
   mp.lastWaiting = msg;
   mp.net.broadcast(msg);
-  if (mp.role === 'host' && mp.inWaiting && mp.phase === 'round') mpRenderWaitingBoard(players);
+  if (mp.role === 'host' && mp.inWaiting && mp.phase === 'round') mpRenderWaitingBoard(msg.players);
 }
 
 /* ----- owner controls: dispatch locally (P2P host) or over the wire (server) -----
@@ -2095,14 +2153,16 @@ function mpClearPendingServerJoin() {
 /* The server welcomed us → commit to server mode; cancel the P2P fallback. */
 function mpServerJoinSucceeded() { mpClearPendingServerJoin(); }
 /* The server attempt failed (deadline / rejected / network) → discard the
-   socket and rejoin the same code over P2P. Never strand the user. */
+   socket and re-attempt the same code over P2P. Never strand the user. A TV
+   watcher falls back to a P2P spectate, not a P2P join. */
 function mpServerJoinFallback() {
   const p = mpPendingServerJoin;
   mpPendingServerJoin = null;
   if (!p) return;
   if (p.timer) clearTimeout(p.timer);
   if (mp.net) { try { mp.net.destroy(); } catch { /* already gone */ } mp.net = null; }
-  mpJoinP2P(p.name, p.code);
+  if (p.spectate) mpSpectateP2P(p.name, p.code);
+  else mpJoinP2P(p.name, p.code);
 }
 
 /* Boot probe: reveal "Host on server" only if the server answers /health.
@@ -2251,8 +2311,97 @@ function mpJoinServer(name, code) {
   showMpLobby();
 }
 
+/* ----- TV SPECTATOR (watch-only) -----
+   A spectator attaches to a room by code and mirrors it read-only: the lobby
+   roster, the live challenge, who's locked in, the reveal, and final
+   standings. It is never seated, scored, or in control. Like Join it tries the
+   authoritative server first (when healthy) and falls back to P2P, so a TV can
+   watch either kind of room from the one button. A name is optional. */
+function mpWatchOnTv() {
+  const name = mpReadName() || 'TV';
+  const code = Net.normalizeCode($('mpCode').value);
+  if (code.length !== 4) { mpSetupError('Enter the 4-digit room code to watch.'); return; }
+  mpSaveName(mpReadName());       // persist only a real typed name (blank stays blank)
+  primeAudio();                    // so audio rounds (Pitch/Tempo) can sound on the TV
+  if (mpServerHealthy && Net.serverConfigured && Net.serverConfigured()) {
+    mpSpectateServer(name, code);
+  } else {
+    mpSpectateP2P(name, code);
+  }
+}
+
+/* Watch a P2P room (spectator twin of mpJoinP2P). */
+function mpSpectateP2P(name, code) {
+  if (!Net.available()) { mpSetupError('Multiplayer needs WebRTC, which this browser lacks.'); return; }
+  mpTeardown();
+
+  mp.active = true;
+  mp.role = 'client';
+  mp.mode = 'p2p';
+  mp.isOwner = false;
+  mp.ownerId = 'host';
+  mp.spectator = true;
+  mp.name = name;
+  mp.code = code;
+  mp.phase = 'lobby';
+  document.body.classList.add('tv-mode');
+
+  mp.net = Net.joinHost(code, {
+    onNetStatus: (s) => mpSetNetStatus(s),
+    onOpen: () => {
+      if (mpReconnectTimer) { clearTimeout(mpReconnectTimer); mpReconnectTimer = null; }
+      mpSetNetStatus('online');
+      mp.net.send({ t: 'spectate', name: mp.name, clientId: mpClientId() });
+    },
+    onData: (msg) => clientOnData(msg),
+    onClose: () => { mpSetNetStatus('reconnecting'); mpScheduleClientReconnect(0); },
+    onError: (err) => mpClientError(err)
+  });
+
+  mpSetNetStatus('connecting');
+  $('mpCodeDisplay').textContent = code;
+  $('mpLobbySub').textContent = 'Connecting as a TV…';
+  $('mpPlayers').innerHTML = '<p class="muted">Connecting to the host…</p>';
+  $('mpHostControls').hidden = true;
+  $('mpLobbyWait').hidden = false;
+  showMpLobby();
+}
+
+/* Watch an authoritative-server room (spectator twin of mpJoinServer), racing
+   the same short fallback deadline. */
+function mpSpectateServer(name, code) {
+  mpTeardown();
+
+  mp.active = true;
+  mp.role = 'client';
+  mp.mode = 'server';
+  mp.isOwner = false;
+  mp.spectator = true;
+  mp.name = name;
+  mp.code = code;
+  mp.phase = 'lobby';
+  mp.serverJoinMsg = { t: 'spectate', code: code, name: name, clientId: mpClientId() };
+  document.body.classList.add('tv-mode');
+
+  const attempt = { name: name, code: code, timer: null, spectate: true };
+  mpPendingServerJoin = attempt;
+  attempt.timer = setTimeout(() => {
+    if (mpPendingServerJoin === attempt) mpServerJoinFallback();
+  }, 3500);
+
+  mpConnectServer();
+  mpSetNetStatus('connecting');
+  $('mpCodeDisplay').textContent = code;
+  $('mpLobbySub').textContent = 'Connecting as a TV…';
+  $('mpPlayers').innerHTML = '<p class="muted">Connecting to the server…</p>';
+  $('mpHostControls').hidden = true;
+  $('mpLobbyWait').hidden = false;
+  showMpLobby();
+}
+
 function clientOnData(msg) {
   if (!msg || typeof msg !== 'object') return;
+  if (mp.spectator) { tvOnData(msg); return; }   // TVs read the room; they never play
   switch (msg.t) {
     case 'welcome':
       mp.meId = msg.playerId;
@@ -2339,6 +2488,94 @@ function mpClientError(err) {
   showMpSetup();
 }
 
+/* A TV spectator consumes the SAME wire messages as a player but read-only: no
+   submit, no owner controls, no score. The reveal / lobby / match-over
+   renderers are already spectator-safe (mp.meId matches no player row, so
+   nothing renders as "you", and mp.isOwner is false so no controls appear).
+   The only differences live here: reconnect re-spectates (not re-joins), a
+   mid-round lobby snapshot must NOT yank the TV off the live challenge, and the
+   answer phase is replaced by a passive "who's locked in" board. */
+function tvOnData(msg) {
+  switch (msg.t) {
+    case 'welcome':
+      mp.meId = msg.playerId;                 // matches no scored row → never "you"
+      mp.isOwner = false;                      // a spectator can never own
+      if (mp.mode === 'server') {
+        mpServerJoinSucceeded();               // committed to the server — cancel P2P fallback
+        if (msg.code) mp.code = msg.code;
+        // Reconnect as a spectator, not a player, so a drop rejoins THIS room read-only.
+        mp.serverJoinMsg = { t: 'spectate', code: mp.code, name: mp.name, clientId: mpClientId() };
+      }
+      tvShowLobby();
+      break;
+    case 'lobby':
+      mp.board = msg.players || [];
+      if (msg.code) mp.code = msg.code;
+      mp.spectatorCount = msg.spectators || 0;
+      // A lobby snapshot also arrives mid-round (a player joined/dropped). Only
+      // follow the room INTO the lobby when it's actually there — never bounce
+      // the TV off a live challenge or reveal.
+      if (msg.phase === 'lobby') { mp.phase = 'lobby'; tvShowLobby(); }
+      break;
+    case 'waiting':
+      mp.waiting = msg.players || [];
+      mp.roundNo = msg.roundNo || mp.roundNo;
+      if (mp.phase === 'round') tvShowGuessing();   // refresh the locked-in board
+      break;
+    case 'round':
+      mpNewRoundCue();
+      mpPlayRound(msg);                        // shows the stimulus, then tvShowGuessing (via mpRespond)
+      break;
+    case 'reveal':
+      showMpReveal(msg);                       // spectator-safe
+      break;
+    case 'matchover':
+      showMpMatchOver(msg);                    // spectator-safe
+      break;
+    case 'ended':
+      mpTeardown();
+      mpGoHome();
+      mpToast('The room closed.');
+      break;
+    case 'rejected':
+    case 'error':
+      // Mid server-spectate race a rejection just means "not a server room" (or
+      // it's full) → fall back to P2P spectate instead of dumping to setup.
+      if (mpPendingServerJoin) { mpServerJoinFallback(); break; }
+      mpTeardown();
+      mpSetupError(msg.message || 'That room is no longer available.');
+      showMpSetup();
+      break;
+    // 'denied' is ignored — a spectator issues no owner intents to be refused.
+  }
+}
+
+/* The TV's lobby view: the room roster + a "waiting for the host" note. Reuses
+   renderMpLobby (mp.isOwner is false → host controls stay hidden). */
+function tvShowLobby() {
+  const watchers = mp.spectatorCount > 1 ? ` · ${mp.spectatorCount} screens watching` : '';
+  $('mpLobbySub').textContent = `Watching room ${mp.code || '----'}${watchers} — waiting for the host to start.`;
+  showMpLobby();
+  renderMpLobby();
+}
+
+/* The TV's answer-phase view: it can't guess, so it shows who's locked in on
+   the shared reveal screen (no compare, no controls). Safe to call repeatedly
+   as `waiting` updates stream in. */
+function tvShowGuessing() {
+  mp.inWaiting = false;
+  const roster = mp.waiting || [];
+  const total = roster.length;
+  const locked = roster.filter(p => p.submitted).length;
+  const game = GAMES[mp.gameKey];
+  $('mpRevealTitle').textContent = `Round ${mp.roundNo}${game ? ' · ' + game.name : ''}`;
+  $('mpRevealSub').textContent = total ? `${locked} of ${total} locked in…` : 'Players are locking in their guesses…';
+  $('mpRevealCompare').innerHTML = '';
+  mpRenderWaitingBoard(roster);
+  $('mpRevealActions').innerHTML = '';         // a spectator has no controls
+  showScreen('mp-reveal');
+}
+
 /* A joiner's data connection can drop while its peer stays alive (e.g. the host
    reloaded and re-hosts on the same code). PeerJS only auto-reconnects the
    broker socket, not this connection — so re-open it ourselves with a capped
@@ -2397,8 +2634,14 @@ function mpPlayRound(round) {
   }
 }
 
-/* Wrap runRespond so submitting scores locally and reports to the host. */
+/* Wrap runRespond so submitting scores locally and reports to the host.
+   A TV spectator has already watched the stimulus (the mpPlay* observe phase
+   ran); it never answers, so instead of the interactive picker it drops to a
+   passive "players are guessing" board. This is the single choke point every
+   mpPlay* funnels through, so branching here keeps the memory test intact (the
+   stimulus still vanished after its observe window) for the one code path. */
 function mpRespond({ title, sub, build, scoreGuess }) {
+  if (mp.spectator) { tvShowGuessing(); return; }
   runRespond({
     title, sub, build,
     onSubmit: (guess) => {
@@ -3003,6 +3246,8 @@ function wireMpActions() {
   const hostServerBtn = $('mpHostServerBtn');
   if (hostServerBtn) hostServerBtn.addEventListener('click', mpBecomeServerHost);
   $('mpJoinBtn').addEventListener('click', mpJoin);
+  const watchBtn = $('mpWatchBtn');
+  if (watchBtn) watchBtn.addEventListener('click', mpWatchOnTv);
   $('mpCode').addEventListener('input', (e) => { e.target.value = Net.normalizeCode(e.target.value); });
   $('mpName').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('mpCode').focus(); } });
   $('mpCode').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); mpJoin(); } });

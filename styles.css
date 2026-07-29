@@ -1160,6 +1160,50 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: none;
 }
 
+/* ── TV Spectator ──────────────────────────────────────────────────────────
+   The "Watch on TV" affordance on the setup screen, plus the tv-mode layer a
+   spectating client wears: a persistent corner chip and gentle legibility
+   bumps so a room reads from across the room on a big screen. */
+.mp-watch {
+  width: 100%;
+}
+.mp-watch-hint {
+  margin: 4px 0 0;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Persistent chip so a passive viewer always knows this screen is a read-only
+   cast, never a seat at the table. pointer-events:none keeps it inert. */
+body.tv-mode::before {
+  content: "📺 Spectating";
+  position: fixed;
+  top: 14px;
+  left: 14px;
+  z-index: 60;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+}
+/* A TV is watched from a distance — widen the roster/board and scale the type. */
+body.tv-mode .mp-lobby,
+body.tv-mode .mp-board {
+  max-width: 820px;
+}
+body.tv-mode .mp-row {
+  font-size: clamp(16px, 2.2vw, 26px);
+}
+body.tv-mode .mp-player {
+  font-size: clamp(16px, 2.2vw, 24px);
+}
+
 /* Transient toast (e.g. host closed the room). */
 .mp-toast {
   position: fixed;
