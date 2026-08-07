@@ -517,6 +517,38 @@ function testSpectatorLifecycle() {
   ok(!rig2.manager.pidRoom.has(s3.pid), 'a refused spectator is left unbound (free to retry)');
 }
 
+/* ============================================================
+   14. A watched room survives idle-GC until the last viewer leaves
+   ============================================================ */
+function testSpectatorKeepsRoomAlive() {
+  section('14. A watched room is not idle-GC\'d until the last viewer leaves');
+  var rig = makeRig({ idleMs: 1000 });
+  var alice = rig.client();
+  alice.send({ t: 'create', name: 'Alice', clientId: 'ca' });
+  var code = alice.last('welcome').code;
+  var room = rig.manager.rooms.get(code);
+
+  // A TV attaches, then the only player leaves — the room is now watcher-only.
+  var tv = rig.client();
+  tv.send({ t: 'spectate', code: code, name: 'TV', clientId: 'tv1' });
+  alice.close();
+  ok(room.hasConnected(), 'a room with a live viewer still reports as connected');
+
+  // Idle well past idleMs — but a viewer is watching, so it must NOT be reaped.
+  rig.clock.advance(2000);
+  var reaped1 = rig.manager.sweep();
+  ok(rig.manager.rooms.has(code), 'a watched room survives idle GC');
+  eq(reaped1.indexOf(code), -1, 'sweep does not reap a room that is being watched');
+
+  // The last viewer leaves → nothing connected → the room is now idle.
+  tv.close();
+  ok(!room.hasConnected(), 'with no players or viewers left, the room is idle');
+  rig.clock.advance(2000);
+  var reaped2 = rig.manager.sweep();
+  ok(!rig.manager.rooms.has(code), 'once the last viewer leaves, the room is GC\'d');
+  ok(reaped2.indexOf(code) !== -1, 'sweep reports the reaped room');
+}
+
 /* ---------- run all ---------- */
 function run() {
   console.log('gamut server — headless authoritative-logic tests');
@@ -533,6 +565,7 @@ function run() {
   testOwnerMigration();
   testSpectator();
   testSpectatorLifecycle();
+  testSpectatorKeepsRoomAlive();
 
   console.log('\n----------------------------------------');
   console.log(passed + ' passed, ' + failed + ' failed');

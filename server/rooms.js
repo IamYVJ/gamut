@@ -466,7 +466,11 @@ Room.prototype._standings = function () {
 
 Room.prototype.hasConnected = function () {
   for (var pl of this.players.values()) if (pl.connected) return true;
-  return false;
+  // A room being cast to a TV is still "in use" even with every player gone —
+  // keep it out of the idle sweep so it isn't GC'd out from under the viewers.
+  // Spectators are dropped on disconnect, so this frees up once the last TV
+  // leaves; a silently-dead TV socket is reaped by index.js's heartbeat first.
+  return this.spectators.size > 0;
 };
 
 /* ============================================================

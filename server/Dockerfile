@@ -23,9 +23,9 @@
 FROM node:20-alpine AS deps
 WORKDIR /app/server
 
-# `package*.json` always matches package.json, and package-lock.json WHEN it
-# exists. There is no committed lockfile yet, so the RUN below falls back to
-# `npm install`; commit a lockfile (see note) to get reproducible `npm ci`.
+# `package*.json` matches package.json AND the committed package-lock.json, so
+# the RUN below takes the reproducible `npm ci` path. The `npm install` fallback
+# below is only a safety net for the case where the lockfile is ever absent.
 COPY server/package*.json ./
 
 # SECURITY NOTE: `npm ci` / `npm install` executes dependency lifecycle
