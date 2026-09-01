@@ -1248,6 +1248,21 @@ body.tv-mode .mp-player {
   font-size: 13px;
 }
 
+/* Visitor count — a quiet footnote under the tagline, revealed by
+   showVisitorCount() only once GoatCounter returns a real number.
+   Deliberately NO `display` property here: the `hidden` attribute
+   (→ [hidden]{display:none!important}, line 35) must win until reveal, so a
+   visitor whose adblocker eats the request never sees a bare "—". Inherits the
+   footer's 13px + centering; uses existing tokens only. */
+.visitor-counter {
+  margin: 4px 0 0;
+  color: var(--muted);
+}
+.visitor-count {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 520px) {
   .topbar { padding: 16px 18px; }
   main { padding: 0 18px 32px; }

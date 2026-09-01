@@ -192,6 +192,10 @@
 
   <footer class="footer">
     <span class="muted">gamut · a suite of static perception games</span>
+    <!-- Visitor count. Kept `hidden` (→ display:none via the global [hidden]
+         rule) until showVisitorCount() fetches a real number, so it adds no
+         height and no layout shift if the request fails or is blocked. -->
+    <p class="visitor-counter" hidden><span id="visitor-count" class="visitor-count">—</span> visitors</p>
   </footer>
 
   <!-- config.js exposes window.GamutConfig (server endpoints) and MUST load
@@ -200,5 +204,13 @@
   <script src="config.js"></script>
   <script src="net.js"></script>
   <script src="script.js"></script>
+
+  <!-- Visitor-count beacon (GoatCounter). `async`, so it never blocks the app
+       scripts above. No canonical link exists, so pageviews file under
+       location.pathname — /gamut/ in production — which showVisitorCount()
+       then queries back. Shared site across projects; per-path keeps counts
+       separate. Privacy-friendly, cookieless, no PII. -->
+  <script data-goatcounter="https://yvj.goatcounter.com/count"
+          async src="//gc.zgo.at/count.js"></script>
 </body>
 </html>

@@ -3373,6 +3373,55 @@ function mpConsumeInviteParam() {
   if (name.value) $('mpJoinBtn').focus(); else name.focus();
 }
 
+/* Fetch this page's all-time visit count from GoatCounter and reveal the footer
+   footnote only once a real number arrives. Purely decorative: every failure
+   path (adblock, offline, analytics disabled, 404) leaves the footnote hidden,
+   so the page is identical whether or not the request succeeds. */
+function showVisitorCount() {
+  const box = document.querySelector('.visitor-counter');
+  const out = document.getElementById('visitor-count');
+  if (!box || !out) return;
+
+  // Derive the host from the beacon tag so the site code lives in exactly one place.
+  const tag = document.querySelector('script[data-goatcounter]');
+  const endpoint = tag && tag.dataset.goatcounter;
+  if (!endpoint) return;
+
+  // Per-path, NOT /counter/TOTAL.json — TOTAL sums every page on the shared
+  // GoatCounter site and would report other projects' traffic as this one's.
+  //
+  // pathname only, deliberately WITHOUT location.search, even though count.js files
+  // under pathname + search. The asymmetry is intentional: a visitor arriving with
+  // tracking params (?fbclid=…) has their view recorded under that longer path but is
+  // still shown the aggregate for the clean path. Matching count.js exactly would 404
+  // for precisely those visitors and hide the counter from them.
+  const path = window.location.pathname;
+
+  // ?start= is a documented parameter (all-time is the default, so this does not change
+  // WHAT is counted) that is ALSO part of the response's cache key. It is pinned for one
+  // specific reason: a path with no data yet answers 404, and GoatCounter caches that 404
+  // for up to four hours — so the bare URL can sit on "no data" for hours AFTER the first
+  // real visit lands, hiding the counter on a fresh deploy. A distinct cache key sidesteps
+  // a 404 that was cached before any data existed.
+  //
+  // Keep it a FIXED date that predates this project's first-ever pageview. Never a relative
+  // period like `week` or `year` — those are rolling windows that would silently stop being
+  // an all-time count. One constant value also means all visitors share a single cached
+  // response instead of forcing a recompute per request.
+  const START = '2026-01-01';
+
+  fetch(`${endpoint.replace(/\/count$/, '')}/counter/${encodeURIComponent(path)}.json?start=${START}`)
+    .then((res) => (res.ok ? res.json() : Promise.reject(new Error('bad status'))))
+    .then((data) => {
+      // `count` arrives pre-formatted with thousands separators ("1,234") — render as-is.
+      if (data && data.count != null) {
+        out.textContent = String(data.count);
+        box.hidden = false;
+      }
+    })
+    .catch(() => { /* purely decorative: leave the footnote hidden on every failure */ });
+}
+
 function boot() {
   initTheme();
   renderModeCards();
@@ -3381,6 +3430,7 @@ function boot() {
   mpInitServerMode();     // async health probe; reveals "Host on server" if up
   showScreen('home');
   mpConsumeInviteParam();
+  showVisitorCount();     // async, decorative; footnote stays hidden unless a count returns
 }
 
 document.addEventListener('DOMContentLoaded', boot);
