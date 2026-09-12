@@ -334,7 +334,18 @@ let audioCtx = null;
 function getAudio() {
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return null;                       // browser has no Web Audio
-  if (!audioCtx) audioCtx = new AC();
+  if (!audioCtx) {
+    // iOS routes Web Audio through the "ambient" session category, which the
+    // hardware Ring/Silent switch mutes — so a muted iPhone plays every round in
+    // total silence even though the gesture/autoplay rules were followed (HTML
+    // <audio>/<video> are exempt, but every sound here is an oscillator, so the
+    // whole app goes quiet). "playback" opts out of the silent switch.
+    // Safari 16.4+ only; undefined elsewhere, so this is a no-op off iOS.
+    try {
+      if ('audioSession' in navigator) navigator.audioSession.type = 'playback';
+    } catch { /* not supported — fall back to default routing */ }
+    audioCtx = new AC();
+  }
   if (audioCtx.state === 'suspended') audioCtx.resume();
   return audioCtx;
 }
