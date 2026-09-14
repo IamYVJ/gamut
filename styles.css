@@ -13,6 +13,11 @@
   --radius-sm: 8px;
   --ease: cubic-bezier(0.4, 0.0, 0.2, 1);
   --t: 220ms;
+  /* The square field the spatial modes (Length / Area / Proportion / Speed)
+     measure against. Viewport-derived on purpose, and matched to .stim-dots so
+     every full-field stimulus in the app lines up. No dark-theme override: it's
+     a geometry token, not a colour. */
+  --stim-field: min(78vmin, 560px);
 }
 
 [data-theme="dark"] {
@@ -408,6 +413,160 @@ main {
   background: var(--text);
 }
 
+/* ---------- Spatial stimuli (Length / Area / Proportion / Speed) ----------
+   Every size in these four modes is a PERCENTAGE of one shared square field,
+   never a pixel count — so a given param renders to the same *proportions* on a
+   phone and on a TV, and a score stays comparable across a multiplayer table.
+
+   The field is `min(100%, var(--stim-field))` rather than a flat token: it
+   resolves to the full token both on the fullscreen observe stage AND inside
+   `main` (checked down to a 320px viewport, where 78vmin is still narrower than
+   the padded column), while shrinking to fit a result card. Stimulus and
+   response rendering at the *same* size is what makes these a memory test
+   rather than a rescaling exercise. Keep that true if you touch these widths.
+
+   The same markup is reused in three places — observe, respond, and the result
+   cards — which is why the primitives live together here instead of being split
+   across the Respond and Result sections below. */
+.stim-line-box,
+.stim-shape-box,
+.stim-bars,
+.stim-track {
+  width: min(100%, var(--stim-field));
+}
+
+/* Length: a bare bar, centred, with no surrounding frame or scale. A visible
+   reference rail would quietly turn this into Proportion mode — the point is to
+   recall an absolute, screen-relative length. */
+.stim-line-box {
+  height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stim-line {
+  display: block;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+/* A stub so the blank response box doesn't read as broken. Fixed pixels, not a
+   fraction of the field, so it can't anchor the guess. */
+.stim-line-box--guess.is-empty::after {
+  content: '';
+  width: 26px;
+  height: 3px;
+  border-radius: 3px;
+  background: var(--border);
+}
+
+/* Area: the frame is drawn in both the stimulus and the response, because
+   "share of the frame" is only meaningful against a visible frame. It's a
+   pseudo-element rather than a border so it can be softened with opacity
+   without fading the shape inside, and so one rule reads correctly on the
+   observe stage (over --bg) and inside a result card (over --surface). */
+.stim-shape-box {
+  position: relative;
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.stim-shape-box::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--muted);
+  border-radius: inherit;
+  opacity: 0.45;
+  pointer-events: none;
+}
+.stim-shape {
+  display: block;
+  background: var(--accent);
+}
+.stim-shape--circle { border-radius: 50%; }
+.stim-shape--square { border-radius: 2px; }
+/* Exactly half the bounding box — which is the identity areaBoxPct() inverts to
+   size a triangle. Don't swap this for a rounded or inset polygon. */
+.stim-shape--triangle { clip-path: polygon(50% 0%, 100% 100%, 0% 100%); }
+
+/* Proportion: two bars sharing a left edge, the clearest ratio comparison. The
+   copy says "the orange bar as a percentage of the grey one", so these two
+   colours are load-bearing. The whole bar is --muted softened rather than
+   --border, which is too faint to read against --bg on the observe stage. */
+.stim-bars {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+}
+.stim-bar {
+  display: block;
+  height: 26px;
+  border-radius: var(--radius-sm);
+}
+.stim-bar--whole {
+  background: var(--muted);
+  opacity: 0.42;
+}
+.stim-bar--part { background: var(--accent); }
+
+/* Speed: a dot crossing a field. The rail spans the track and is inset by the
+   dot's radius at each end, so translating it 0→100% of itself walks the dot
+   from flush-left to flush-right with neither end clipped by `overflow`. That
+   inset shrinks the travelled distance by one dot-width, identically for the
+   stimulus and the preview — so a given %/s still renders at the same px/s in
+   both, which is the property the matching task actually depends on. */
+.stim-track {
+  position: relative;
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+.stim-track::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--muted);
+  border-radius: inherit;
+  opacity: 0.3;
+  pointer-events: none;
+}
+.stim-track--stim { aspect-ratio: 1; }
+/* The response and result tracks are short bands. Speed is measured against the
+   track's WIDTH, so trimming the height costs nothing and keeps the slider
+   above the fold. */
+.stim-track--guess { height: 104px; }
+.stim-track--mini { height: 52px; }
+
+.stim-rail {
+  position: absolute;
+  left: 9px;                    /* the traveller's radius; see the note above */
+  width: calc(100% - 18px);
+  height: 0;                    /* a zero-height line, so inline `top: N%` places the lane */
+  will-change: transform;
+}
+.stim-traveller {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 18px;
+  height: 18px;
+  margin: -9px 0 0 -9px;        /* centre the dot on the rail's origin */
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+
+/* On the result screen the shown value is muted and the player's guess keeps
+   the accent — the same convention as .dial--target above. */
+.stim-line-box--target .stim-line,
+.stim-shape-box--target .stim-shape,
+.stim-bars--target .stim-bar--part { background: var(--muted); }
+
 .countdown {
   position: absolute;
   top: 24px;
@@ -574,6 +733,9 @@ input[type="range"]::-moz-range-thumb {
 }
 .readout.is-empty { color: var(--muted); }
 .estimate .range { width: min(100%, 460px); }
+/* Length / Area / Speed carry a live preview rather than (or above) a bare
+   number, so they want the slider closer to the thing it drives. */
+.estimate--spatial { gap: 20px; }
 
 /* Angle dial */
 .dial-wrap {
@@ -699,6 +861,14 @@ input[type="range"]::-moz-range-thumb {
   width: 100%;
   height: 100%;
 }
+
+/* The spatial modes reuse their stimulus markup as result media. Widths already
+   collapse to the card via `min(100%, …)`; these just trim the fixed heights so
+   two cards fit side by side. Both cards are always the same width, so the pair
+   stays directly comparable even though it's smaller than the original field. */
+.value-card .stim-line-box { height: 48px; }
+.value-card .stim-bars { gap: 12px; }
+.value-card .stim-bar { height: 20px; }
 
 .result-swatch { margin: 0; }
 .result-color {
@@ -1269,9 +1439,15 @@ body.tv-mode .mp-player {
 }
 
 /* Respect reduced-motion: drop the ready pulse, screen fades, ring sweep, and
-   hover nudges. The numeric countdown still ticks via JS, so timing is intact. */
+   hover nudges. The numeric countdown still ticks via JS, so timing is intact.
+
+   .stim-rail is exempt because in Speed mode the motion IS the stimulus, not
+   decoration — collapsing it to 0.01ms would delete the quantity being judged.
+   In practice the rail animates via the Web Animations API, which CSS
+   `animation-*`/`transition-*` never touched anyway; the exemption exists so the
+   no-WAAPI `transition` fallback in animateRail() survives here too. */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *:not(.stim-rail), *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;

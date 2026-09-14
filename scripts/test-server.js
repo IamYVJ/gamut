@@ -549,6 +549,172 @@ function testSpectatorKeepsRoomAlive() {
   ok(reaped2.indexOf(code) !== -1, 'sweep reports the reaped room');
 }
 
+/* ============================================================
+   15. The spatial modes play end-to-end and are re-scored server-side
+   ============================================================ */
+function testSpatialModes() {
+  section('15. Spatial modes (length / area / proportion / speed) round-trip');
+  // The target lives under a different key per mode; everything else is shared.
+  var modes = [
+    { key: 'length',     target: 'pct' },
+    { key: 'area',       target: 'areaPct' },
+    { key: 'proportion', target: 'pct' },
+    { key: 'speed',      target: 'speedPct' }
+  ];
+
+  for (var i = 0; i < modes.length; i++) {
+    var key = modes[i].key, targetKey = modes[i].target;
+    ok(Engine.GAME_KEYS.indexOf(key) !== -1, key + ': is an accepted game key');
+
+    var rig = makeRig();
+    var host = rig.client(), guest = rig.client();
+    host.send({ t: 'create', name: 'Host', clientId: 'h-' + key });
+    var code = host.last('welcome').code;
+    guest.send({ t: 'join', code: code, name: 'Guest', clientId: 'g-' + key });
+
+    host.send({ t: 'start', gameKey: key });
+    var p = roundParams(host);
+    ok(p && p[targetKey] > 0, key + ': server-generated params carry a positive ' + targetKey);
+    // Same stimulus for everyone, or the leaderboard compares nothing.
+    eq(JSON.stringify(roundParams(guest)), JSON.stringify(p),
+       key + ': host and guest are sent identical params');
+
+    var actual = p[targetKey];
+    // Host nails it but under-claims; guest is 2x off but claims a perfect 100.
+    host.send({ t: 'submit', roundNo: 1, guessValue: actual, score: 3 });
+    guest.send({ t: 'submit', roundNo: 1, guessValue: actual * 2, score: 100 });
+
+    var reveal = host.last('reveal');
+    ok(!!reveal, key + ': reveal broadcast once all submit');
+    var hRow = reveal && rowOf(reveal.results, host.pid);
+    var gRow = reveal && rowOf(reveal.results, guest.pid);
+    eq(hRow && hRow.roundScore, 100, key + ': an exact guess scores 100 despite claiming 3');
+    ok(gRow && gRow.roundScore !== 100, key + ': spoofed score:100 was IGNORED');
+    eq(gRow && gRow.roundScore, Engine.clampScore(Engine.scoreGuess(key, p, actual * 2).score),
+       key + ': the off guess got the engine-recomputed value');
+  }
+
+  /* Speed's two params are drawn together on purpose: if distance were fixed,
+     how long the traverse lasted would be a perfect proxy for speed and the mode
+     would collapse into Time. Assert the traverse stays inside its window across
+     the whole speed range, so that decoupling can't silently regress. */
+  var minMs = Infinity, maxMs = -Infinity, minSpeed = Infinity, maxSpeed = -Infinity;
+  var badDir = 0, badDist = 0;
+  for (var n = 0; n < 4000; n++) {
+    var sp = Engine.generateParams('speed');
+    var ms = (sp.distancePct / sp.speedPct) * 1000;
+    if (ms < minMs) minMs = ms;
+    if (ms > maxMs) maxMs = ms;
+    if (sp.speedPct < minSpeed) minSpeed = sp.speedPct;
+    if (sp.speedPct > maxSpeed) maxSpeed = sp.speedPct;
+    if (sp.dir !== 1 && sp.dir !== -1) badDir++;
+    if (sp.distancePct < Engine.SPEED_MIN_DIST_PCT || sp.distancePct > Engine.SPEED_MAX_DIST_PCT) badDist++;
+  }
+  eq(badDir, 0, 'speed: dir is always +1 or -1');
+  eq(badDist, 0, 'speed: distancePct never escapes its band');
+  // Rounding distancePct to 1dp can push the traverse a hair past the window, so
+  // allow a 1% tolerance rather than asserting the raw bounds.
+  ok(minMs >= Engine.SPEED_MIN_TRAVEL_MS * 0.99 && maxMs <= Engine.SPEED_MAX_TRAVEL_MS * 1.01,
+     'speed: traverse duration stays inside [' + Engine.SPEED_MIN_TRAVEL_MS + ', ' +
+     Engine.SPEED_MAX_TRAVEL_MS + ']ms (got ' + Math.round(minMs) + '-' + Math.round(maxMs) + ')');
+  ok(minSpeed >= Engine.SPEED_MIN_PCT && maxSpeed <= Engine.SPEED_MAX_PCT,
+     'speed: speedPct never escapes its band');
+  // The whole point of drawing distance AFTER speed: if travel time were a proxy
+  // for speed, the mode would collapse into Time. Both must vary independently.
+  ok(maxSpeed - minSpeed > (Engine.SPEED_MAX_PCT - Engine.SPEED_MIN_PCT) * 0.9,
+     'speed: the full speed range is reachable, not just the middle');
+  ok(maxMs - minMs > (Engine.SPEED_MAX_TRAVEL_MS - Engine.SPEED_MIN_TRAVEL_MS) * 0.9,
+     'speed: travel time also varies widely, so it is not a proxy for speed');
+}
+
+/* ============================================================
+   16. engine.js and script.js still agree on every numeric formula
+
+   engine.js's header documents the deliberate duplication: the browser keeps its
+   own copies of these pure functions so the static site works with no build step
+   and no module loader. That is a standing drift risk — a multiplier tweaked in
+   one file and not the other would mean the server silently re-scores a player
+   differently from what their own screen showed them. This section fuzzes both
+   copies against each other so CI catches that the moment it happens.
+   ============================================================ */
+function extractFn(src, name) {
+  var head = src.indexOf('function ' + name + '(');
+  if (head < 0) return null;
+  var depth = 0, i = src.indexOf('{', head);
+  if (i < 0) return null;
+  for (; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0) return src.slice(head, i + 1);
+  }
+  return null;
+}
+
+function testFormulaParity() {
+  section('16. engine.js <-> script.js numeric formula parity');
+  var fs = require('fs'), path = require('path');
+  var scriptSrc = fs.readFileSync(path.join(__dirname, '..', 'script.js'), 'utf8');
+
+  // Every self-contained numeric scorer (Math.* only). Colour is excluded: its
+  // deltaE path pulls in helpers and is covered through scoreGuess elsewhere.
+  var names = ['scoreTime', 'scoreCount', 'scoreAngle', 'scorePitch', 'scoreTempo',
+               'scoreLength', 'scoreArea', 'scoreProportion', 'scoreSpeed'];
+
+  // A fixed LCG, so a failure reproduces exactly instead of appearing one run in ten.
+  var seed = 20260913;
+  function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+
+  for (var n = 0; n < names.length; n++) {
+    var name = names[n];
+    var src = extractFn(scriptSrc, name);
+    ok(!!src, name + ': found in script.js');
+    if (!src) continue;
+
+    var browserFn;
+    try { browserFn = new Function('return (' + src + ');')(); }
+    catch (e) { ok(false, name + ': script.js copy parses standalone'); continue; }
+
+    var engineFn = Engine[name];
+    ok(typeof engineFn === 'function', name + ': exported from engine.js');
+    if (typeof engineFn !== 'function') continue;
+
+    var mismatch = null;
+    // Edge cases first (equal inputs, tiny target, wildly-off guess), then fuzz.
+    var cases = [[1, 1], [0.5, 400], [400, 0.5], [12, 92], [92, 12], [60, 15]];
+    for (var f = 0; f < 400; f++) cases.push([0.5 + rnd() * 400, 0.5 + rnd() * 400]);
+
+    for (var c = 0; c < cases.length && !mismatch; c++) {
+      var a = cases[c][0], b = cases[c][1];
+      var ea = engineFn(a, b), ba = browserFn(a, b);
+      var keys = Object.keys(ea);
+      if (keys.join(',') !== Object.keys(ba).join(',')) {
+        mismatch = 'shape ' + fmt(Object.keys(ba)) + ' vs ' + fmt(keys);
+        break;
+      }
+      for (var k = 0; k < keys.length; k++) {
+        if (ea[keys[k]] !== ba[keys[k]]) {
+          mismatch = '(' + a + ', ' + b + ') → ' + keys[k] + ' ' +
+                     fmt(ba[keys[k]]) + ' (script) vs ' + fmt(ea[keys[k]]) + ' (engine)';
+          break;
+        }
+      }
+    }
+    ok(!mismatch, name + ': identical in both files' + (mismatch ? ' — DRIFT: ' + mismatch : ''));
+  }
+
+  /* The other half of the drift risk: a mode the engine knows about but the home
+     screen never offers (or vice versa). GAMES drives both the mode grid and the
+     multiplayer picker, so its keys must be exactly GAME_KEYS. */
+  var reg = scriptSrc.slice(scriptSrc.search(/const GAMES\s*=/));
+  var regKeys = [];
+  for (var m = 0; m < Engine.GAME_KEYS.length; m++) {
+    // Top-level registry entries are indented exactly two spaces.
+    if (new RegExp('\\n  ' + Engine.GAME_KEYS[m] + ': \\{').test(reg)) regKeys.push(Engine.GAME_KEYS[m]);
+  }
+  eq(regKeys.length, Engine.GAME_KEYS.length,
+     'every Engine.GAME_KEYS mode has a GAMES entry in script.js');
+  eq(Engine.GAME_KEYS.length, 10, 'GAME_KEYS covers all ten modes');
+}
+
 /* ---------- run all ---------- */
 function run() {
   console.log('gamut server — headless authoritative-logic tests');
@@ -566,6 +732,8 @@ function run() {
   testSpectator();
   testSpectatorLifecycle();
   testSpectatorKeepsRoomAlive();
+  testSpatialModes();
+  testFormulaParity();
 
   console.log('\n----------------------------------------');
   console.log(passed + ' passed, ' + failed + ' failed');

@@ -109,6 +109,26 @@ function scoreTempo(actual, guess) {
   const delta = Math.abs(actual - guess);
   return { score: Math.max(0, Math.round(100 - 140 * (delta / actual))), delta };
 }
+/* The four spatial modes score on relative error too; only the multiplier
+   differs, tuned to how precise human judgement actually is for that quantity.
+   See the matching block in engine.js for the full rationale — and keep these
+   multipliers identical to it. */
+function scoreLength(actualPct, guessPct) {
+  const delta = Math.abs(actualPct - guessPct);
+  return { score: Math.max(0, Math.round(100 - 200 * (delta / actualPct))), delta };
+}
+function scoreArea(actualPct, guessPct) {
+  const delta = Math.abs(actualPct - guessPct);
+  return { score: Math.max(0, Math.round(100 - 120 * (delta / actualPct))), delta };
+}
+function scoreProportion(actualPct, guessPct) {
+  const delta = Math.abs(actualPct - guessPct);
+  return { score: Math.max(0, Math.round(100 - 150 * (delta / actualPct))), delta };
+}
+function scoreSpeed(actualPct, guessPct) {
+  const delta = Math.abs(actualPct - guessPct);
+  return { score: Math.max(0, Math.round(100 - 150 * (delta / actualPct))), delta };
+}
 
 
 /* ---------- 2. Shared engine ---------- */
@@ -123,7 +143,8 @@ const state = {
   timers: [],        // pending setTimeout/interval ids to clear on navigation
   ring: null,        // active countdown interval
   raf: null,         // pending requestAnimationFrame for the countdown ring
-  sound: null        // active audio source (tunable tone / metronome) to silence on navigation
+  sound: null,       // active audio source (tunable tone / metronome) to silence on navigation
+  motion: null       // active looping animation (Speed's preview dot) to halt on navigation
 };
 
 function setTimer(fn, ms) {
@@ -138,6 +159,7 @@ function clearTimers() {
   if (state.ring) { clearInterval(state.ring); state.ring = null; }
   if (state.raf) { cancelAnimationFrame(state.raf); state.raf = null; }
   if (state.sound) { state.sound.stop(); state.sound = null; }
+  if (state.motion) { state.motion.stop(); state.motion = null; }
 }
 
 function showScreen(name) {
@@ -261,6 +283,7 @@ function runRespond({ title, sub, build, onSubmit, submitLabel = 'Lock in' }) {
 /* Generic result screen. */
 function showResult({ compareClass = '', compareHTML, score, label, detail = '', secondary = null }) {
   if (state.sound) { state.sound.stop(); state.sound = null; }   // stop the live guess tone
+  if (state.motion) { state.motion.stop(); state.motion = null; } // …and the live guess motion
   const compare = $('resultCompare');
   compare.className = `result-compare ${compareClass}`.trim();
   compare.innerHTML = compareHTML;
@@ -1234,6 +1257,471 @@ function tempoResult(actual, guess) {
 }
 
 
+/* ---------- 6d. Spatial modes (Length / Area / Proportion / Speed) ----------
+   Every size below is a PERCENTAGE of the shared square stimulus field (CSS
+   `--stim-field`), never a pixel count — so the same params render to the same
+   proportions on a phone and a TV, and a multiplayer score is comparable across
+   the table. The field resolves to the same value on the fullscreen observe
+   screen and inside the respond screen (it's viewport-relative, not
+   container-relative), which is what makes "reproduce what you saw" a fair test
+   rather than a rescaling exercise.
+
+   These constants and the randomSpeedParams() body are duplicated from
+   engine.js — see the note at the top of that file. Keep them identical. */
+
+const LENGTH_MIN_PCT = 12;
+const LENGTH_MAX_PCT = 92;
+const AREA_MIN_PCT = 3;
+const AREA_MAX_PCT = 45;
+const AREA_SHAPES = ['circle', 'square', 'triangle'];
+const PROP_MIN_PCT = 15;
+const PROP_MAX_PCT = 85;
+const PROP_WHOLE_MIN = 55;
+const PROP_WHOLE_MAX = 95;
+const SPEED_MIN_PCT = 15;
+const SPEED_MAX_PCT = 60;
+const SPEED_MIN_TRAVEL_MS = 1300;
+const SPEED_MAX_TRAVEL_MS = 3600;
+const SPEED_MIN_DIST_PCT = 45;
+const SPEED_MAX_DIST_PCT = 95;
+
+/* Guess sliders run a little wider than the target ranges above, so the
+   endpoints don't quietly reveal the bounds the target was drawn from. */
+const LENGTH_GUESS_MIN = 5,  LENGTH_GUESS_MAX = 95;
+const AREA_GUESS_MIN = 1,    AREA_GUESS_MAX = 60;
+const PROP_GUESS_MIN = 5,    PROP_GUESS_MAX = 95;
+const SPEED_GUESS_MIN = 12,  SPEED_GUESS_MAX = 70;
+
+const round1 = v => Math.round(v * 10) / 10;
+
+
+/* ----- Length: reproduce a remembered line ----- */
+
+function lineMarkup(pct, extraClass = '') {
+  const w = clamp(Number(pct) || 0, 0, 100);
+  return `
+    <div class="stim-line-box ${extraClass}">
+      <span class="stim-line" style="width:${w}%"></span>
+    </div>`;
+}
+
+function startLength() {
+  state.gameKey = 'length';
+  state.again = startLength;
+  const pct = round1(LENGTH_MIN_PCT + Math.random() * (LENGTH_MAX_PCT - LENGTH_MIN_PCT));
+
+  runObserve({
+    readyMs: 1000,
+    showMs: 1000,
+    buildStimulus: (stage) => stage.insertAdjacentHTML('beforeend', lineMarkup(pct, 'stim-line-box--stim')),
+    onDone: () => lengthRespond(pct)
+  });
+}
+
+function lengthRespond(actualPct) {
+  runRespond({
+    title: 'How long was the line?',
+    sub: 'Drag until the bar matches the length you saw, then lock it in.',
+    build: (mount) => buildLengthMatcher(mount),
+    onSubmit: (guess) => lengthResult(actualPct, guess)
+  });
+}
+
+/* Deliberately no numeric readout — the bar IS the readout, and showing a
+   percentage would turn a perceptual match into arithmetic. It starts blank
+   rather than at the midpoint for the same reason buildValueSlider takes
+   `hideUntilInput`: a visible default anchors the guess. Submission stays
+   blocked until the slider actually moves. */
+function buildLengthMatcher(mount) {
+  mount.classList.add('estimate', 'estimate--spatial');
+  const init = Math.round((LENGTH_GUESS_MIN + LENGTH_GUESS_MAX) / 2);
+  mount.innerHTML = `
+    ${lineMarkup(0, 'stim-line-box--guess is-empty')}
+    <input class="range" type="range" min="${LENGTH_GUESS_MIN}" max="${LENGTH_GUESS_MAX}"
+           step="0.5" value="${init}" aria-label="Line length" />`;
+  const input = mount.querySelector('input');
+  const box = mount.querySelector('.stim-line-box');
+  const line = mount.querySelector('.stim-line');
+  const submit = $('respondSubmit');
+  submit.disabled = true;
+
+  input.addEventListener('input', () => {
+    box.classList.remove('is-empty');
+    line.style.width = `${Number(input.value)}%`;
+    submit.disabled = false;
+  });
+  return () => Number(input.value);
+}
+
+function lengthResult(actualPct, guessPct) {
+  const { score, delta } = scoreLength(actualPct, guessPct);
+  const compareHTML = valueRow(
+    { label: 'Shown', value: `${round1(actualPct)}%`, media: lineMarkup(actualPct, 'stim-line-box--target') },
+    { label: 'Your line', value: `${round1(guessPct)}%`, media: lineMarkup(guessPct, 'stim-line-box--guess') }
+  );
+  showResult({
+    compareClass: 'result-compare--values',
+    compareHTML,
+    score,
+    label: qualitative(score),
+    detail: `off by ${round1(delta)}%`
+  });
+}
+
+
+/* ----- Area: reproduce how much of the frame a shape covered ----- */
+
+/* A shape's bounding-box side, as a % of the field's side, such that the shape
+   covers `areaPct` % of the field's AREA. Exact for all three shapes:
+     square    s² = f·S²                 → s = S·√f
+     triangle  ½·b·h = f·S²   (b = h)    → b = S·√(2f)
+     circle    πr² = f·S²                → d = 2S·√(f/π)
+   At the 45% cap the widest of the three (triangle, √0.9 ≈ 0.949) still fits. */
+function areaBoxPct(areaPct, shape) {
+  const f = Math.max(0, Number(areaPct) || 0) / 100;
+  if (shape === 'square')   return 100 * Math.sqrt(f);
+  if (shape === 'triangle') return 100 * Math.sqrt(2 * f);
+  return 100 * 2 * Math.sqrt(f / Math.PI);
+}
+
+/* The frame is drawn in both the stimulus and the response: "share of the
+   frame" is only a meaningful quantity against a visible frame. */
+function shapeMarkup(areaPct, shape, extraClass = '') {
+  const kind = AREA_SHAPES.includes(shape) ? shape : 'circle';
+  const size = clamp(areaBoxPct(areaPct, kind), 0, 100);
+  return `
+    <div class="stim-shape-box ${extraClass}">
+      <span class="stim-shape stim-shape--${kind}" style="width:${size}%;height:${size}%"></span>
+    </div>`;
+}
+
+function startArea() {
+  state.gameKey = 'area';
+  state.again = startArea;
+  const areaPct = round1(AREA_MIN_PCT + Math.random() * (AREA_MAX_PCT - AREA_MIN_PCT));
+  const shape = AREA_SHAPES[Math.floor(Math.random() * AREA_SHAPES.length)];
+
+  runObserve({
+    readyMs: 1000,
+    showMs: 900,
+    buildStimulus: (stage) => stage.insertAdjacentHTML('beforeend', shapeMarkup(areaPct, shape, 'stim-shape-box--stim')),
+    onDone: () => areaRespond(areaPct, shape)
+  });
+}
+
+function areaRespond(actualPct, shape) {
+  runRespond({
+    title: 'How much did it cover?',
+    sub: 'Resize the shape until it fills the frame the way the one you saw did.',
+    build: (mount) => buildAreaMatcher(mount, shape),
+    onSubmit: (guess) => areaResult(actualPct, guess, shape)
+  });
+}
+
+/* The slider is linear in AREA, not in width — so the shape grows the way the
+   judged quantity grows, and the notoriously compressive area percept isn't
+   quietly linearised by the control. It reuses the stimulus's shape on purpose:
+   matching a circle's area with a square is a different, much harder task. */
+function buildAreaMatcher(mount, shape) {
+  mount.classList.add('estimate', 'estimate--spatial');
+  const kind = AREA_SHAPES.includes(shape) ? shape : 'circle';
+  const init = Math.round((AREA_MIN_PCT + AREA_MAX_PCT) / 2);
+  mount.innerHTML = `
+    ${shapeMarkup(0, kind, 'stim-shape-box--guess is-empty')}
+    <input class="range" type="range" min="${AREA_GUESS_MIN}" max="${AREA_GUESS_MAX}"
+           step="0.5" value="${init}" aria-label="Share of the frame covered" />`;
+  const input = mount.querySelector('input');
+  const box = mount.querySelector('.stim-shape-box');
+  const el = mount.querySelector('.stim-shape');
+  const submit = $('respondSubmit');
+  submit.disabled = true;
+
+  input.addEventListener('input', () => {
+    box.classList.remove('is-empty');
+    const size = clamp(areaBoxPct(Number(input.value), kind), 0, 100);
+    el.style.width = `${size}%`;
+    el.style.height = `${size}%`;
+    submit.disabled = false;
+  });
+  return () => Number(input.value);
+}
+
+function areaResult(actualPct, guessPct, shape) {
+  const { score, delta } = scoreArea(actualPct, guessPct);
+  const compareHTML = valueRow(
+    { label: 'Covered', value: `${round1(actualPct)}%`, media: shapeMarkup(actualPct, shape, 'stim-shape-box--target') },
+    { label: 'Your shape', value: `${round1(guessPct)}%`, media: shapeMarkup(guessPct, shape, 'stim-shape-box--guess') }
+  );
+  showResult({
+    compareClass: 'result-compare--values',
+    compareHTML,
+    score,
+    label: qualitative(score),
+    detail: `off by ${round1(delta)}%`
+  });
+}
+
+
+/* ----- Proportion: judge one bar against another ----- */
+
+function barsMarkup(pct, wholePct, extraClass = '') {
+  const whole = clamp(Number(wholePct) || 0, 0, 100);
+  const part = clamp(whole * (Number(pct) || 0) / 100, 0, 100);
+  return `
+    <div class="stim-bars ${extraClass}">
+      <span class="stim-bar stim-bar--whole" style="width:${whole}%"></span>
+      <span class="stim-bar stim-bar--part" style="width:${part}%"></span>
+    </div>`;
+}
+
+function startProportion() {
+  state.gameKey = 'proportion';
+  state.again = startProportion;
+  const pct = round1(PROP_MIN_PCT + Math.random() * (PROP_MAX_PCT - PROP_MIN_PCT));
+  // The whole bar's own width varies too, so its absolute size can't be used as
+  // a cue — the only stable signal is the ratio between the two bars.
+  const wholePct = round1(PROP_WHOLE_MIN + Math.random() * (PROP_WHOLE_MAX - PROP_WHOLE_MIN));
+
+  runObserve({
+    readyMs: 1000,
+    showMs: 1100,
+    buildStimulus: (stage) => stage.insertAdjacentHTML('beforeend', barsMarkup(pct, wholePct, 'stim-bars--stim')),
+    onDone: () => proportionRespond(pct, wholePct)
+  });
+}
+
+/* Unlike Length and Area this one asks for a NUMBER rather than a reproduction:
+   both bars were on screen together, so the ratio is a quantity the player can
+   read off directly — there's no absolute size to hold in memory. That also
+   keeps one purely numeric estimator among the four spatial modes. */
+function proportionRespond(actualPct, wholePct) {
+  runRespond({
+    title: 'What share was the orange bar?',
+    sub: 'Estimate the orange bar as a percentage of the grey one, then lock it in.',
+    build: (mount) => buildValueSlider(mount, {
+      min: PROP_GUESS_MIN, max: PROP_GUESS_MAX, step: 1, init: 50,
+      format: v => `${v}%`,
+      hideUntilInput: true
+    }),
+    onSubmit: (guess) => proportionResult(actualPct, guess, wholePct)
+  });
+}
+
+function proportionResult(actualPct, guessPct, wholePct) {
+  const { score, delta } = scoreProportion(actualPct, guessPct);
+  // Both replays use the same `wholePct`, so the two orange bars are directly
+  // comparable — the miss is visible, not just arithmetic.
+  const compareHTML = valueRow(
+    { label: 'Actual', value: `${round1(actualPct)}%`, media: barsMarkup(actualPct, wholePct, 'stim-bars--target') },
+    { label: 'You guessed', value: `${round1(guessPct)}%`, media: barsMarkup(guessPct, wholePct, 'stim-bars--guess') }
+  );
+  showResult({
+    compareClass: 'result-compare--values',
+    compareHTML,
+    score,
+    label: qualitative(score),
+    detail: `off by ${round1(delta)}%`
+  });
+}
+
+
+/* ----- Speed: match how fast a dot crossed the frame ----- */
+
+/* Speed's two params are coupled, so they get a helper rather than an inline
+   expression. Distance is drawn AFTER speed, from whatever window keeps the
+   traverse inside [SPEED_MIN_TRAVEL_MS, SPEED_MAX_TRAVEL_MS] *and* inside the
+   legal distance band. That decoupling is the whole point of the mode: with a
+   fixed distance, travel time would be a perfect proxy for speed and the player
+   could just count seconds — i.e. it would collapse into Time mode.
+   Mirrors Engine.randomSpeedParams(). */
+function randomSpeedParams() {
+  const speedPct = SPEED_MIN_PCT + Math.random() * (SPEED_MAX_PCT - SPEED_MIN_PCT);
+  const minD = Math.max(SPEED_MIN_DIST_PCT, speedPct * (SPEED_MIN_TRAVEL_MS / 1000));
+  const maxD = Math.max(minD, Math.min(SPEED_MAX_DIST_PCT, speedPct * (SPEED_MAX_TRAVEL_MS / 1000)));
+  return {
+    speedPct: round1(speedPct),
+    distancePct: round1(minD + Math.random() * (maxD - minD)),
+    dir: Math.random() < 0.5 ? 1 : -1,           // travels left→right or right→left
+    lanePct: Math.round(25 + Math.random() * 50) // vertical lane, so it isn't always centred
+  };
+}
+
+function speedTravelMs(p) {
+  const speed = Number(p.speedPct) > 0 ? Number(p.speedPct) : SPEED_MIN_PCT;
+  return (clamp(Number(p.distancePct) || 0, 0, 100) / speed) * 1000;
+}
+
+function railMarkup(lanePct) {
+  return `<span class="stim-rail" style="top:${clamp(Number(lanePct) || 50, 0, 100)}%">
+            <span class="stim-traveller"></span>
+          </span>`;
+}
+
+/* Drive a rail from a% to b% of its own width over `ms`. Because the rail spans
+   the whole track, translating it by N% of itself moves the dot by N% of the
+   TRACK — parent-relative distance with a compositor-friendly transform.
+   (Animating `left` in % would be exact too, but runs on the main thread, and
+   jank there would corrupt the very quantity being judged.)
+   Returns a handle with stop(). */
+function animateRail(rail, a, b, ms, opts = {}) {
+  if (typeof rail.animate === 'function') {
+    const anim = rail.animate(
+      [{ transform: `translateX(${a}%)` }, { transform: `translateX(${b}%)` }],
+      {
+        duration: ms,
+        easing: 'linear',
+        iterations: opts.loop ? Infinity : 1,
+        direction: opts.loop ? 'alternate' : 'normal',   // bounce, so there's no jump at the seam
+        fill: 'forwards'
+      }
+    );
+    if (opts.paused) anim.pause();
+    return {
+      anim,
+      start() { try { anim.play(); } catch { /* detached */ } },
+      stop()  { try { anim.cancel(); } catch { /* already gone */ } }
+    };
+  }
+  // No Web Animations API: fall back to a one-shot CSS transition. A looping
+  // fallback isn't worth the machinery, so the preview simply doesn't animate.
+  if (opts.loop) return null;
+  rail.style.transform = `translateX(${a}%)`;
+  requestAnimationFrame(() => {
+    rail.style.transition = `transform ${ms}ms linear`;
+    rail.style.transform = `translateX(${b}%)`;
+  });
+  return { start() {}, stop() { rail.style.transition = ''; } };
+}
+
+function buildTravelStim(stage, p) {
+  const span = clamp(Number(p.distancePct) || 0, 0, 100);
+  const from = (100 - span) / 2;                 // centre the traverse in the track
+  const to = from + span;
+  const [a, b] = Number(p.dir) === -1 ? [to, from] : [from, to];
+
+  const box = document.createElement('div');
+  box.className = 'stim-track stim-track--stim';
+  box.innerHTML = railMarkup(p.lanePct);
+  // Attach *before* animating, so the animation's timeline starts in sync with
+  // the first painted frame rather than while the node is still detached.
+  stage.appendChild(box);
+  animateRail(box.querySelector('.stim-rail'), a, b, speedTravelMs(p));
+}
+
+/* A looping preview dot, paused until the player first touches the slider (an
+   already-moving dot would anchor the guess exactly as a visible default value
+   does). One animation is created at a fixed base duration and re-rated rather
+   than cancelled and rebuilt, so changing speed keeps the dot's phase instead
+   of making it jump on every slider tick. */
+function createSpeedPreview(rail) {
+  const baseMs = (100 / SPEED_MIN_PCT) * 1000;   // one crossing at the slowest speed
+  const handle = animateRail(rail, 0, 100, baseMs, { loop: true, paused: true });
+  if (!handle) return null;
+  return {
+    setSpeed(pct) {
+      const rate = Math.max(0.05, Number(pct) / SPEED_MIN_PCT);
+      if (typeof handle.anim.updatePlaybackRate === 'function') handle.anim.updatePlaybackRate(rate);
+      else handle.anim.playbackRate = rate;
+    },
+    start: handle.start,
+    stop: handle.stop
+  };
+}
+
+function startSpeed() {
+  state.gameKey = 'speed';
+  state.again = startSpeed;
+  const p = randomSpeedParams();
+
+  runObserve({
+    readyMs: 1000,
+    // A short tail after the dot lands, so the end of the traverse is seen
+    // rather than cut off — the stimulus is the motion, not the endpoint.
+    showMs: speedTravelMs(p) + 300,
+    buildStimulus: (stage) => buildTravelStim(stage, p),
+    onDone: () => speedRespond(p)
+  });
+}
+
+function speedRespond(p) {
+  runRespond({
+    title: 'How fast was it moving?',
+    sub: 'Drag to set a speed — the dot matches it. Lock in when it feels right.',
+    build: (mount) => buildSpeedMatcher(mount),
+    onSubmit: (guess) => speedResult(p, guess)
+  });
+}
+
+function buildSpeedMatcher(mount) {
+  mount.classList.add('estimate', 'estimate--spatial');
+  const init = Math.round((SPEED_GUESS_MIN + SPEED_GUESS_MAX) / 2);
+  mount.innerHTML = `
+    <div class="readout is-empty">—</div>
+    <div class="stim-track stim-track--guess">${railMarkup(50)}</div>
+    <input class="range" type="range" min="${SPEED_GUESS_MIN}" max="${SPEED_GUESS_MAX}"
+           step="0.5" value="${init}" aria-label="Speed" />`;
+  const input = mount.querySelector('input');
+  const readout = mount.querySelector('.readout');
+  const submit = $('respondSubmit');
+  submit.disabled = true;
+
+  const preview = createSpeedPreview(mount.querySelector('.stim-rail'));
+  state.motion = preview;   // halted by clearTimers() / showResult() / mpSubmit()
+  let started = false;
+
+  input.addEventListener('input', () => {
+    const v = Number(input.value);
+    readout.classList.remove('is-empty');
+    readout.textContent = `${round1(v)} %/s`;
+    submit.disabled = false;
+    if (preview) {
+      preview.setSpeed(v);
+      if (!started) { started = true; preview.start(); }
+    }
+  });
+  return () => Number(input.value);
+}
+
+/* A mini track plus a replay button, so the result screen can actually show the
+   difference — "38 vs 46 %/s" means nothing without seeing both. */
+function speedCardMedia(pct) {
+  return `
+    <div class="stim-track stim-track--mini">${railMarkup(50)}</div>
+    <button class="btn audio-btn" data-speed="${round1(pct)}" type="button">▶ Replay</button>`;
+}
+
+function wireSpeedReplays(root) {
+  root.querySelectorAll('[data-speed]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const card = btn.closest('.value-card') || root;
+      const rail = card.querySelector('.stim-rail');
+      const pct = Number(btn.dataset.speed);
+      if (!rail || !(pct > 0)) return;
+      // Only one replay at a time, and it stops on navigation (clearTimers).
+      if (state.motion) { state.motion.stop(); state.motion = null; }
+      state.motion = animateRail(rail, 0, 100, (100 / pct) * 1000);
+    });
+  });
+}
+
+function speedResult(p, guessPct) {
+  const actual = Number(p.speedPct);
+  const { score, delta } = scoreSpeed(actual, guessPct);
+  const compareHTML = valueRow(
+    { label: 'Actual', value: `${round1(actual)} %/s`, media: speedCardMedia(actual) },
+    { label: 'Your guess', value: `${round1(guessPct)} %/s`, media: speedCardMedia(guessPct) }
+  );
+  showResult({
+    compareClass: 'result-compare--values',
+    compareHTML,
+    score,
+    label: qualitative(score),
+    detail: `off by ${round1(delta)} %/s`
+  });
+  wireSpeedReplays($('resultCompare'));
+}
+
+
 /* ---------- 7. Game registry + home ---------- */
 
 const GAMES = {
@@ -1260,6 +1748,30 @@ const GAMES = {
     desc: 'A needle points somewhere — reproduce the angle.',
     preview: 'conic-gradient(#ff5b3a 0 25%, #ffb84d 25% 50%, #4dd0a8 50% 75%, #4d8dff 75% 100%)',
     start: startAngle
+  },
+  length: {
+    name: 'Length',
+    desc: 'A line flashes — redraw it at the length you remember.',
+    preview: 'linear-gradient(90deg, #4dd0a8 0 62%, rgba(255,255,255,0.14) 62%) 0 50% / 100% 14% no-repeat, linear-gradient(135deg, #14413a, #0c2621)',
+    start: startLength
+  },
+  area: {
+    name: 'Area',
+    desc: 'A shape flashes — resize one to cover the same area.',
+    preview: 'radial-gradient(circle at 50% 50%, #ffb84d 0 27%, transparent 27.5%), linear-gradient(135deg, #452f13, #261a0b)',
+    start: startArea
+  },
+  proportion: {
+    name: 'Proportion',
+    desc: 'Two bars, side by side — judge one against the other.',
+    preview: 'linear-gradient(90deg, #ff5b3a 0 38%, transparent 38%) 0 68% / 100% 15% no-repeat, linear-gradient(90deg, rgba(255,255,255,0.28) 0 84%, transparent 84%) 0 32% / 100% 15% no-repeat, linear-gradient(135deg, #2e1b4f, #1a1030)',
+    start: startProportion
+  },
+  speed: {
+    name: 'Speed',
+    desc: 'A dot crosses the frame — match how fast it moved.',
+    preview: 'radial-gradient(circle at 76% 50%, #8ab6ff 0 8%, transparent 8.5%), linear-gradient(90deg, transparent 18%, rgba(77,141,255,0.6) 72%) 0 50% / 100% 10% no-repeat, linear-gradient(135deg, #12203f, #0a1426)',
+    start: startSpeed
   },
   pitch: {
     name: 'Pitch',
@@ -1747,6 +2259,20 @@ function mpGenerateParams(gameKey, spaceKey) {
       return { freq: PITCH_MIN * Math.pow(PITCH_MAX / PITCH_MIN, Math.random()) };
     case 'tempo':
       return { bpm: TEMPO_MIN + Math.floor(Math.random() * (TEMPO_MAX - TEMPO_MIN + 1)) };
+    case 'length':
+      return { pct: round1(LENGTH_MIN_PCT + Math.random() * (LENGTH_MAX_PCT - LENGTH_MIN_PCT)) };
+    case 'area':
+      return {
+        areaPct: round1(AREA_MIN_PCT + Math.random() * (AREA_MAX_PCT - AREA_MIN_PCT)),
+        shape: AREA_SHAPES[Math.floor(Math.random() * AREA_SHAPES.length)]
+      };
+    case 'proportion':
+      return {
+        pct: round1(PROP_MIN_PCT + Math.random() * (PROP_MAX_PCT - PROP_MIN_PCT)),
+        wholePct: round1(PROP_WHOLE_MIN + Math.random() * (PROP_WHOLE_MAX - PROP_WHOLE_MIN))
+      };
+    case 'speed':
+      return randomSpeedParams();
     default:
       return {};
   }
@@ -2627,7 +3153,9 @@ function mpPlayRound(round) {
 
   const play = {
     colour: mpPlayColour, time: mpPlayTime, count: mpPlayCount,
-    angle: mpPlayAngle, pitch: mpPlayPitch, tempo: mpPlayTempo
+    angle: mpPlayAngle, pitch: mpPlayPitch, tempo: mpPlayTempo,
+    length: mpPlayLength, area: mpPlayArea,
+    proportion: mpPlayProportion, speed: mpPlaySpeed
   }[round.gameKey];
   if (play) play(mp.params);
   // The Time round is a duration-estimation game — a visible ticking countdown
@@ -2822,12 +3350,77 @@ function mpPlayTempo(p) {
   });
 }
 
+/* The four spatial modes reuse the single-player observe/respond builders
+   verbatim — the only difference is that the params arrive from the host or the
+   server instead of being rolled locally, so every peer sees the same line,
+   shape, bar pair or traverse. */
+
+function mpPlayLength(p) {
+  runObserve({
+    readyMs: 1000,
+    showMs: 1000,
+    buildStimulus: (stage) => stage.insertAdjacentHTML('beforeend', lineMarkup(p.pct, 'stim-line-box--stim')),
+    onDone: () => mpRespond({
+      title: 'How long was the line?',
+      sub: 'Drag until the bar matches the length you saw, then lock it in.',
+      build: (mount) => buildLengthMatcher(mount),
+      scoreGuess: (guess) => ({ score: scoreLength(p.pct, guess).score, guessValue: guess })
+    })
+  });
+}
+
+function mpPlayArea(p) {
+  runObserve({
+    readyMs: 1000,
+    showMs: 900,
+    buildStimulus: (stage) => stage.insertAdjacentHTML('beforeend', shapeMarkup(p.areaPct, p.shape, 'stim-shape-box--stim')),
+    onDone: () => mpRespond({
+      title: 'How much did it cover?',
+      sub: 'Resize the shape until it fills the frame the way the one you saw did.',
+      build: (mount) => buildAreaMatcher(mount, p.shape),
+      scoreGuess: (guess) => ({ score: scoreArea(p.areaPct, guess).score, guessValue: guess })
+    })
+  });
+}
+
+function mpPlayProportion(p) {
+  runObserve({
+    readyMs: 1000,
+    showMs: 1100,
+    buildStimulus: (stage) => stage.insertAdjacentHTML('beforeend', barsMarkup(p.pct, p.wholePct, 'stim-bars--stim')),
+    onDone: () => mpRespond({
+      title: 'What share was the orange bar?',
+      sub: 'Estimate the orange bar as a percentage of the grey one, then lock it in.',
+      build: (mount) => buildValueSlider(mount, {
+        min: PROP_GUESS_MIN, max: PROP_GUESS_MAX, step: 1, init: 50,
+        format: v => `${v}%`, hideUntilInput: true
+      }),
+      scoreGuess: (guess) => ({ score: scoreProportion(p.pct, guess).score, guessValue: guess })
+    })
+  });
+}
+
+function mpPlaySpeed(p) {
+  runObserve({
+    readyMs: 1000,
+    showMs: speedTravelMs(p) + 300,
+    buildStimulus: (stage) => buildTravelStim(stage, p),
+    onDone: () => mpRespond({
+      title: 'How fast was it moving?',
+      sub: 'Drag to set a speed — the dot matches it. Lock in when it feels right.',
+      build: (mount) => buildSpeedMatcher(mount),
+      scoreGuess: (guess) => ({ score: scoreSpeed(p.speedPct, guess).score, guessValue: guess })
+    })
+  });
+}
+
 /* ----- submit / waiting / reveal ----- */
 
 function mpSubmit(score, guessValue) {
   if (mp.submitted) return;
   mp.submitted = true;
   if (state.sound) { state.sound.stop(); state.sound = null; }
+  if (state.motion) { state.motion.stop(); state.motion = null; }
   if (mp.mode === 'p2p' && mp.role === 'host') {
     hostRecordSubmit('host', score, guessValue);
     hostBroadcastWaiting();
@@ -2956,6 +3549,34 @@ function mpCompareHTML(payload) {
                      media: `<button class="btn audio-btn" data-bpm="${g}" type="button">▶ Hear</button>` })
                  : valueCard(actual);
     }
+    case 'length': {
+      const actual = { label: 'Shown', value: `${round1(p.pct)}%`,
+        media: lineMarkup(p.pct, 'stim-line-box--target') };
+      return has ? valueRow(actual, { label: 'Your line', value: `${round1(g)}%`,
+                     media: lineMarkup(g, 'stim-line-box--guess') })
+                 : valueCard(actual);
+    }
+    case 'area': {
+      const actual = { label: 'Covered', value: `${round1(p.areaPct)}%`,
+        media: shapeMarkup(p.areaPct, p.shape, 'stim-shape-box--target') };
+      return has ? valueRow(actual, { label: 'Your shape', value: `${round1(g)}%`,
+                     media: shapeMarkup(g, p.shape, 'stim-shape-box--guess') })
+                 : valueCard(actual);
+    }
+    case 'proportion': {
+      const actual = { label: 'Actual', value: `${round1(p.pct)}%`,
+        media: barsMarkup(p.pct, p.wholePct, 'stim-bars--target') };
+      return has ? valueRow(actual, { label: 'You guessed', value: `${round1(g)}%`,
+                     media: barsMarkup(g, p.wholePct, 'stim-bars--guess') })
+                 : valueCard(actual);
+    }
+    case 'speed': {
+      const actual = { label: 'Actual', value: `${round1(p.speedPct)} %/s`,
+        media: speedCardMedia(p.speedPct) };
+      return has ? valueRow(actual, { label: 'Your guess', value: `${round1(g)} %/s`,
+                     media: speedCardMedia(g) })
+                 : valueCard(actual);
+    }
     default:
       return '';
   }
@@ -2972,6 +3593,10 @@ function mpAnswerLabel(guessValue) {
     case 'angle':  txt = `${Math.round(guessValue)}°`; break;
     case 'pitch':  txt = `${Math.round(guessValue)} Hz`; break;
     case 'tempo':  txt = `${guessValue} BPM`; break;
+    case 'length':
+    case 'area':
+    case 'proportion': txt = `${round1(guessValue)}%`; break;
+    case 'speed':  txt = `${round1(guessValue)} %/s`; break;
     default: return '';
   }
   return ` <span class="mp-answer">${escapeHtml(txt)}</span>`;
@@ -3012,6 +3637,26 @@ function mpErrorLabel(guessValue) {
     case 'tempo': {
       const d = scoreTempo(p.bpm, Number(guessValue)).delta;
       txt = d === 0 ? 'exact' : `off by ${d} BPM`;
+      break;
+    }
+    case 'length': {
+      if (!(p.pct > 0)) return '';
+      txt = `off by ${round1(scoreLength(p.pct, Number(guessValue)).delta)}%`;
+      break;
+    }
+    case 'area': {
+      if (!(p.areaPct > 0)) return '';
+      txt = `off by ${round1(scoreArea(p.areaPct, Number(guessValue)).delta)}%`;
+      break;
+    }
+    case 'proportion': {
+      if (!(p.pct > 0)) return '';
+      txt = `off by ${round1(scoreProportion(p.pct, Number(guessValue)).delta)}%`;
+      break;
+    }
+    case 'speed': {
+      if (!(p.speedPct > 0)) return '';
+      txt = `off by ${round1(scoreSpeed(p.speedPct, Number(guessValue)).delta)} %/s`;
       break;
     }
     default: return '';
@@ -3149,6 +3794,7 @@ function mpWireReplayButtons() {
   compare.querySelectorAll('[data-bpm]').forEach(btn => {
     btn.addEventListener('click', () => playBeats(Number(btn.dataset.bpm), 4));
   });
+  wireSpeedReplays(compare);
 }
 
 /* ----- lobby rendering ----- */

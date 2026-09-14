@@ -106,12 +106,65 @@
     return { score: Math.max(0, Math.round(100 - 140 * (delta / actual))), delta: delta };
   }
 
+  /* The four spatial modes all score on RELATIVE error, like Time/Count/Tempo
+     above — only the multiplier differs, and each one is tuned to how precise
+     human judgement actually is for that quantity:
+
+       length     200  Reproducing a remembered line with a slider is the most
+                       precise of the four, so it demands the most precision:
+                       a 10% miss (visibly wrong) lands at 80, not 86.
+       area       120  Area judgement is famously compressive — people
+                       systematically UNDERestimate large areas by 20–30% — so
+                       the curve is deliberately the most forgiving here.
+       proportion 150  Part-of-whole ratio judgement sits in between.
+       speed      150  Matched against a live preview, so mid-range precision.
+
+     Note the asymmetry inherent in relative error: a fixed miss costs more
+     against a small target than a large one. That is intentional and matches
+     the existing modes (Count treats "off by 2" the same way). */
+  function scoreLength(actualPct, guessPct) {
+    var delta = Math.abs(actualPct - guessPct);
+    return { score: Math.max(0, Math.round(100 - 200 * (delta / actualPct))), delta: delta };
+  }
+  function scoreArea(actualPct, guessPct) {
+    var delta = Math.abs(actualPct - guessPct);
+    return { score: Math.max(0, Math.round(100 - 120 * (delta / actualPct))), delta: delta };
+  }
+  function scoreProportion(actualPct, guessPct) {
+    var delta = Math.abs(actualPct - guessPct);
+    return { score: Math.max(0, Math.round(100 - 150 * (delta / actualPct))), delta: delta };
+  }
+  function scoreSpeed(actualPct, guessPct) {
+    var delta = Math.abs(actualPct - guessPct);
+    return { score: Math.max(0, Math.round(100 - 150 * (delta / actualPct))), delta: delta };
+  }
+
   /* ---------- mode constants ---------- */
 
   var PITCH_MIN = 220;    // A3
   var PITCH_MAX = 880;    // A5
   var TEMPO_MIN = 60;
   var TEMPO_MAX = 160;
+
+  /* Spatial modes. Every length/size below is a PERCENTAGE of the shared square
+     stimulus field (CSS `--stim-field`), never a pixel count — so the same
+     params render to the same *proportions* on a phone and a TV, and a score is
+     comparable across the table in multiplayer. */
+  var LENGTH_MIN_PCT = 12;    // shortest line, as % of the field's width
+  var LENGTH_MAX_PCT = 92;
+  var AREA_MIN_PCT = 3;       // smallest shape, as % of the field's AREA
+  var AREA_MAX_PCT = 45;      // 45% still fits all three shapes inside the field
+  var AREA_SHAPES = ['circle', 'square', 'triangle'];
+  var PROP_MIN_PCT = 15;      // part as % of whole
+  var PROP_MAX_PCT = 85;
+  var PROP_WHOLE_MIN = 55;    // the "whole" bar's own width, as % of the field…
+  var PROP_WHOLE_MAX = 95;    // …varied so absolute width can't be used as a cue
+  var SPEED_MIN_PCT = 15;     // % of the field travelled per second
+  var SPEED_MAX_PCT = 60;
+  var SPEED_MIN_TRAVEL_MS = 1300;   // keep the traverse watchable but not tedious
+  var SPEED_MAX_TRAVEL_MS = 3600;
+  var SPEED_MIN_DIST_PCT = 45;      // …while the distance stays clearly sub/supra-field
+  var SPEED_MAX_DIST_PCT = 95;
 
   /* ---------- per-palette random target generators ----------
      Each returns an sRGB {r,g,b} inside that palette's gamut. These MUST match
@@ -138,7 +191,30 @@
     return positions;
   }
 
-  var GAME_KEYS = ['colour', 'time', 'count', 'angle', 'pitch', 'tempo'];
+  function round1(v) { return Math.round(v * 10) / 10; }
+
+  /* Speed's two params are coupled, so they get a helper rather than an inline
+     expression. Distance is drawn AFTER speed, from whatever window keeps the
+     traverse inside [SPEED_MIN_TRAVEL_MS, SPEED_MAX_TRAVEL_MS] *and* inside the
+     legal distance band. That decoupling is the whole point of the mode: if
+     distance were fixed, travel time would be a perfect proxy for speed and the
+     player could just count seconds (i.e. it would collapse into Time mode). */
+  function randomSpeedParams() {
+    var speedPct = SPEED_MIN_PCT + Math.random() * (SPEED_MAX_PCT - SPEED_MIN_PCT);
+    var minD = Math.max(SPEED_MIN_DIST_PCT, speedPct * (SPEED_MIN_TRAVEL_MS / 1000));
+    var maxD = Math.max(minD, Math.min(SPEED_MAX_DIST_PCT, speedPct * (SPEED_MAX_TRAVEL_MS / 1000)));
+    return {
+      speedPct: round1(speedPct),
+      distancePct: round1(minD + Math.random() * (maxD - minD)),
+      dir: Math.random() < 0.5 ? 1 : -1,          // travels left→right or right→left
+      lanePct: Math.round(25 + Math.random() * 50) // vertical lane, so it isn't always centred
+    };
+  }
+
+  var GAME_KEYS = [
+    'colour', 'time', 'count', 'angle', 'pitch', 'tempo',
+    'length', 'area', 'proportion', 'speed'
+  ];
 
   /* ---------- shared per-round stimulus generator (authoritative) ----------
      Mirrors mpGenerateParams() in script.js. The server calls this once per
@@ -162,6 +238,20 @@
         return { freq: PITCH_MIN * Math.pow(PITCH_MAX / PITCH_MIN, Math.random()) };
       case 'tempo':
         return { bpm: TEMPO_MIN + Math.floor(Math.random() * (TEMPO_MAX - TEMPO_MIN + 1)) };
+      case 'length':
+        return { pct: round1(LENGTH_MIN_PCT + Math.random() * (LENGTH_MAX_PCT - LENGTH_MIN_PCT)) };
+      case 'area':
+        return {
+          areaPct: round1(AREA_MIN_PCT + Math.random() * (AREA_MAX_PCT - AREA_MIN_PCT)),
+          shape: AREA_SHAPES[Math.floor(Math.random() * AREA_SHAPES.length)]
+        };
+      case 'proportion':
+        return {
+          pct: round1(PROP_MIN_PCT + Math.random() * (PROP_MAX_PCT - PROP_MIN_PCT)),
+          wholePct: round1(PROP_WHOLE_MIN + Math.random() * (PROP_WHOLE_MAX - PROP_WHOLE_MIN))
+        };
+      case 'speed':
+        return randomSpeedParams();
       default:
         return {};
     }
@@ -215,6 +305,18 @@
       case 'tempo':
         if (!(params.bpm > 0)) return null;
         return scoreTempo(params.bpm, Number(guess));
+      case 'length':
+        if (!(params.pct > 0)) return null;
+        return scoreLength(params.pct, Number(guess));
+      case 'area':
+        if (!(params.areaPct > 0)) return null;
+        return scoreArea(params.areaPct, Number(guess));
+      case 'proportion':
+        if (!(params.pct > 0)) return null;
+        return scoreProportion(params.pct, Number(guess));
+      case 'speed':
+        if (!(params.speedPct > 0)) return null;
+        return scoreSpeed(params.speedPct, Number(guess));
       default:
         return null;
     }
@@ -232,14 +334,34 @@
     scoreColour: scoreColour,
     scorePitch: scorePitch,
     scoreTempo: scoreTempo,
+    scoreLength: scoreLength,
+    scoreArea: scoreArea,
+    scoreProportion: scoreProportion,
+    scoreSpeed: scoreSpeed,
     PITCH_MIN: PITCH_MIN,
     PITCH_MAX: PITCH_MAX,
     TEMPO_MIN: TEMPO_MIN,
     TEMPO_MAX: TEMPO_MAX,
+    LENGTH_MIN_PCT: LENGTH_MIN_PCT,
+    LENGTH_MAX_PCT: LENGTH_MAX_PCT,
+    AREA_MIN_PCT: AREA_MIN_PCT,
+    AREA_MAX_PCT: AREA_MAX_PCT,
+    AREA_SHAPES: AREA_SHAPES,
+    PROP_MIN_PCT: PROP_MIN_PCT,
+    PROP_MAX_PCT: PROP_MAX_PCT,
+    PROP_WHOLE_MIN: PROP_WHOLE_MIN,
+    PROP_WHOLE_MAX: PROP_WHOLE_MAX,
+    SPEED_MIN_PCT: SPEED_MIN_PCT,
+    SPEED_MAX_PCT: SPEED_MAX_PCT,
+    SPEED_MIN_TRAVEL_MS: SPEED_MIN_TRAVEL_MS,
+    SPEED_MAX_TRAVEL_MS: SPEED_MAX_TRAVEL_MS,
+    SPEED_MIN_DIST_PCT: SPEED_MIN_DIST_PCT,
+    SPEED_MAX_DIST_PCT: SPEED_MAX_DIST_PCT,
     SPACE_RANDOM: SPACE_RANDOM,
     SPACE_KEYS: SPACE_KEYS,
     GAME_KEYS: GAME_KEYS,
     randomDotPositions: randomDotPositions,
+    randomSpeedParams: randomSpeedParams,
     generateParams: generateParams,
     cleanGuess: cleanGuess,
     clampScore: clampScore,
